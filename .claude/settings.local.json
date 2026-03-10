@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npx vite:*)",
+      "Bash(node:*)",
+      "Bash(\"C:/Users/Rodrigo Fernandes/Desktop/LogOff_Web_Claude_Code/demo-backend/.env\":*)",
+      "Bash(PORT=8099 timeout 4 node:*)",
+      "Bash(curl:*)",
+      "Bash(netstat:*)",
+      "Bash(taskkill:*)"
+    ]
+  }
+}
