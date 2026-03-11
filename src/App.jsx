@@ -233,15 +233,13 @@ function classifySolanaRpcError(err){
   const msg=String(err?.message||err||"").toLowerCase();
   const status=err?.status||err?.statusCode||0;
   if(status===403||msg.includes("403")||msg.includes("forbidden")){
-    if(CFG.devMode) console.error("[LOGOFF Pay] Solana RPC rejected request (403). Use a dedicated RPC provider via VITE_SOLANA_RPC_URL.");
     return "rpc_rejected";
   }
   if(status===429||msg.includes("429")||msg.includes("too many")||msg.includes("rate limit")){
-    if(CFG.devMode) console.error("[LOGOFF Pay] Solana RPC rate limited (429). Use a dedicated RPC provider.");
     return "rpc_rejected";
   }
-  if(msg.includes("failed to fetch")||msg.includes("networkerror")||msg.includes("network error")||msg.includes("fetch")){
-    if(CFG.devMode) console.error("[LOGOFF Pay] Solana RPC network error. Check VITE_SOLANA_RPC_URL.");
+  // Only match explicit network-level failures, NOT any string containing "fetch"
+  if(msg.includes("failed to fetch")||msg.includes("networkerror")||msg.includes("network error")||msg.includes("econnrefused")||msg.includes("dns")){
     return "rpc_rejected";
   }
   return "fetch_failed";
@@ -283,89 +281,102 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
           if(CFG.devMode) console.log("[LOGOFF Pay] Base USDC balance raw:",usdcRaw.toString(),"parsed:",usdc);
           if(!cancelled) setBalance({usdc,native:null,loading:false,error:null});
         }else{
-          if(CFG.devMode) console.log("[LOGOFF Pay] === Solana balance fetch start ===");
-          if(CFG.devMode) console.log("[LOGOFF Pay] RPC URL:",CFG.solanaRpc);
+          // ═══ SOLANA BALANCE FETCH — numbered steps for diagnostics ═══
+          const log=CFG.devMode?(...a)=>console.log("[LOGOFF Pay]",...a):()=>{};
+          const logErr=CFG.devMode?(...a)=>console.error("[LOGOFF Pay]",...a):()=>{};
 
-          const connection=new Connection(CFG.solanaRpc,"confirmed");
-          const USDC_MINT_STR="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-          const usdcMint=new PublicKey(USDC_MINT_STR);
+          log("═══ Solana balance fetch START ═══");
+          log("Step 0: RPC URL =",CFG.solanaRpc);
 
-          // Always use string addresses to avoid cross-library PublicKey issues
-          const provider=window.phantom?.solana||window.solana;
-          const providerAddr=provider?.publicKey?.toString()||null;
-          const walletAddr=wallet.addr;
-          const effectiveAddr=providerAddr||walletAddr;
-
-          if(CFG.devMode){
-            console.log("[LOGOFF Pay] wallet.addr:",walletAddr);
-            console.log("[LOGOFF Pay] provider.publicKey:",providerAddr);
-            console.log("[LOGOFF Pay] effectiveAddr:",effectiveAddr);
+          // Step 1: create connection
+          let connection;
+          try{
+            connection=new Connection(CFG.solanaRpc,"confirmed");
+            log("Step 1: Connection created OK");
+          }catch(e){
+            logErr("Step 1 FAILED: Connection constructor threw:",e?.name,e?.message,e);
+            if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"rpc_rejected"});
+            return;
           }
 
-          // Create PublicKey from string (never from Phantom's PublicKey object)
-          const fromPubkey=new PublicKey(effectiveAddr);
-          if(CFG.devMode) console.log("[LOGOFF Pay] fromPubkey created:",fromPubkey.toString());
+          // Step 2: resolve addresses
+          const provider=window.phantom?.solana||window.solana;
+          const providerAddr=provider?.publicKey?.toString()||null;
+          const effectiveAddr=providerAddr||wallet.addr;
+          log("Step 2: wallet.addr =",wallet.addr);
+          log("Step 2: provider.publicKey =",providerAddr);
+          log("Step 2: effectiveAddr =",effectiveAddr);
 
-          // Derive ATAs using official helper
-          let fromATA,recipientATA;
+          // Step 3: create PublicKeys from strings
+          let fromPubkey,usdcMint;
           try{
-            fromATA=await getAssociatedTokenAddress(usdcMint,fromPubkey);
-            const recipientPubkey=new PublicKey(CFG.recipientSOL);
-            recipientATA=await getAssociatedTokenAddress(usdcMint,recipientPubkey);
-            if(CFG.devMode){
-              console.log("[LOGOFF Pay] Sender ATA:",fromATA.toString());
-              console.log("[LOGOFF Pay] Recipient ATA:",recipientATA.toString());
-            }
-          }catch(ataDerivErr){
-            if(CFG.devMode) console.error("[LOGOFF Pay] ATA derivation failed:",ataDerivErr?.name,ataDerivErr?.message,ataDerivErr);
+            fromPubkey=new PublicKey(effectiveAddr);
+            usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+            log("Step 3: fromPubkey =",fromPubkey.toString());
+            log("Step 3: usdcMint =",usdcMint.toString());
+          }catch(e){
+            logErr("Step 3 FAILED: PublicKey constructor threw:",e?.name,e?.message,e);
             if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});
             return;
           }
 
-          // SOL balance for fees
+          // Step 4: derive sender ATA
+          let fromATA;
+          try{
+            fromATA=await getAssociatedTokenAddress(usdcMint,fromPubkey);
+            log("Step 4: Sender ATA =",fromATA.toString());
+          }catch(e){
+            logErr("Step 4 FAILED: getAssociatedTokenAddress threw:",e?.name,e?.message,e);
+            if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});
+            return;
+          }
+
+          // Step 5: get SOL balance
           let sol=0;
           try{
-            if(CFG.devMode) console.log("[LOGOFF Pay] Calling getBalance...");
             const solLamports=await connection.getBalance(fromPubkey);
             sol=solLamports/1e9;
-            if(CFG.devMode) console.log("[LOGOFF Pay] SOL balance:",sol,"(",solLamports,"lamports)");
-          }catch(solErr){
-            const errType=classifySolanaRpcError(solErr);
-            if(CFG.devMode) console.error("[LOGOFF Pay] getBalance failed ("+errType+"):",solErr?.name,solErr?.message,solErr);
+            log("Step 5: SOL balance =",sol,"(",solLamports,"lamports)");
+          }catch(e){
+            const errType=classifySolanaRpcError(e);
+            logErr("Step 5 FAILED: getBalance threw ("+errType+"):",e?.name,e?.message,e);
             if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:errType});
             return;
           }
 
-          // USDC balance via getAccount
+          // Step 6: get USDC balance from sender ATA
           let usdc=0;
           try{
-            if(CFG.devMode) console.log("[LOGOFF Pay] Calling getAccount for sender ATA...");
             const tokenAccount=await getAccount(connection,fromATA);
             usdc=Number(tokenAccount.amount)/1e6;
-            if(CFG.devMode) console.log("[LOGOFF Pay] getAccount OK — raw:",tokenAccount.amount.toString(),"parsed:",usdc,"USDC");
-          }catch(ataErr){
-            // Check by error name (robust across library versions)
-            const errName=ataErr?.name||"";
-            if(ataErr instanceof TokenAccountNotFoundError||errName==="TokenAccountNotFoundError"){
-              if(CFG.devMode) console.log("[LOGOFF Pay] No USDC ATA found — balance is 0");
+            log("Step 6: getAccount OK — raw amount =",tokenAccount.amount.toString(),"parsed =",usdc,"USDC");
+          }catch(e){
+            const errName=e?.name||"";
+            log("Step 6: getAccount threw — name="+errName+" message="+e?.message);
+            if(e instanceof TokenAccountNotFoundError||errName==="TokenAccountNotFoundError"){
+              log("Step 6: Sender has no USDC ATA — balance = 0");
               usdc=0;
             }else if(errName==="TokenInvalidAccountOwnerError"){
-              if(CFG.devMode) console.log("[LOGOFF Pay] ATA exists but wrong owner — treating as 0");
+              log("Step 6: ATA exists but wrong owner — balance = 0");
               usdc=0;
             }else{
-              const errType=classifySolanaRpcError(ataErr);
-              if(CFG.devMode) console.error("[LOGOFF Pay] getAccount failed ("+errType+"):",ataErr?.name,ataErr?.message,ataErr);
+              // Real error — classify and report
+              const errType=classifySolanaRpcError(e);
+              logErr("Step 6 FAILED ("+errType+"):",e?.name,e?.message,e);
               if(!cancelled) setBalance({usdc:null,native:sol,loading:false,error:errType});
               return;
             }
           }
 
-          if(CFG.devMode) console.log("[LOGOFF Pay] === Final — USDC:",usdc,"SOL:",sol,"===");
+          log("═══ Solana balance fetch DONE — USDC:",usdc,"SOL:",sol,"═══");
           if(!cancelled) setBalance({usdc,native:sol,loading:false,error:null});
         }
       }catch(e){
+        // This outer catch only fires if something completely unexpected throws
+        // (e.g. import failure, syntax error in the above code, etc.)
+        const logErr=CFG.devMode?(...a)=>console.error("[LOGOFF Pay]",...a):()=>{};
+        logErr("OUTER CATCH — unexpected error:",e?.name,e?.message,e);
         const errType=classifySolanaRpcError(e);
-        if(CFG.devMode) console.error("[LOGOFF Pay] Balance fetch error ("+errType+"):",e);
         if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:errType});
       }
     };
@@ -674,8 +685,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         <div className="pay-balance">
           {balance.loading&&<span style={{color:"var(--mute)"}}>Checking balance...</span>}
           {balance.error==="wrong_chain"&&<span style={{color:"var(--warn,#f5a623)"}}>Wrong network — switch to Base</span>}
-          {balance.error==="rpc_rejected"&&<span style={{color:"#e74c3c"}}>Could not reach the Solana RPC. Please try again shortly.</span>}
-          {balance.error==="fetch_failed"&&<span style={{color:"#e74c3c"}}>Could not read balance. Please try again.</span>}
+          {balance.error==="rpc_rejected"&&<span style={{color:"#e74c3c"}}>Solana RPC unavailable. Please try again shortly.</span>}
+          {balance.error==="fetch_failed"&&<span style={{color:"#e74c3c"}}>Could not read your Solana USDC balance. Check console for details.</span>}
           {balanceLoaded&&<>
             <span style={{color:insufficientUSDC?"#e74c3c":"var(--dim)"}}>Balance: {balance.usdc.toFixed(2)} USDC</span>
             {payChain==="solana"&&balance.native!==null&&<span style={{color:insufficientSOL?"#e74c3c":"var(--mute)",marginLeft:8,fontSize:12}}>({balance.native.toFixed(4)} SOL)</span>}
