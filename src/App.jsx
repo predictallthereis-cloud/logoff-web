@@ -13,6 +13,7 @@ const CFG = {
   amount: 149,
   baseChainId: "0x2105",
   backendUrl: import.meta.env.VITE_BACKEND_URL || "http://localhost:8080",
+  solanaRpc: import.meta.env.VITE_SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
   contactDM: "@LogoffAnon on X",
   contactEmail: "logoff@proton.me", // REPLACE
   refundDays: 7,
@@ -225,6 +226,25 @@ function WidgetDemo(){
 
 /* ══════════════════════════ PURCHASE ══════════════════════════ */
 
+/* Classify Solana RPC errors into actionable types */
+function classifySolanaRpcError(err){
+  const msg=String(err?.message||err||"").toLowerCase();
+  const status=err?.status||err?.statusCode||0;
+  if(status===403||msg.includes("403")||msg.includes("forbidden")){
+    if(CFG.devMode) console.error("[LOGOFF Pay] Solana RPC rejected request (403). Use a dedicated RPC provider via VITE_SOLANA_RPC_URL.");
+    return "rpc_rejected";
+  }
+  if(status===429||msg.includes("429")||msg.includes("too many")||msg.includes("rate limit")){
+    if(CFG.devMode) console.error("[LOGOFF Pay] Solana RPC rate limited (429). Use a dedicated RPC provider.");
+    return "rpc_rejected";
+  }
+  if(msg.includes("failed to fetch")||msg.includes("networkerror")||msg.includes("network error")||msg.includes("fetch")){
+    if(CFG.devMode) console.error("[LOGOFF Pay] Solana RPC network error. Check VITE_SOLANA_RPC_URL.");
+    return "rpc_rejected";
+  }
+  return "fetch_failed";
+}
+
 function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
   const[payChain,setPayChain]=useState("base");
   const[ws,setWs]=useState("idle"); // idle | paying | done
@@ -271,7 +291,9 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
             });
           }
           const{Connection,PublicKey}=window.solanaWeb3;
-          const connection=new Connection("https://api.mainnet-beta.solana.com","confirmed");
+
+          if(CFG.devMode) console.log("[LOGOFF Pay] Solana RPC URL:",CFG.solanaRpc);
+          const connection=new Connection(CFG.solanaRpc,"confirmed");
 
           // Validate wallet address matches Phantom provider
           const provider=window.phantom?.solana||window.solana;
@@ -283,7 +305,7 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
             if(providerAddr&&providerAddr!==walletAddr) console.warn("[LOGOFF Pay] MISMATCH: wallet.addr differs from provider.publicKey!");
           }
 
-          // Use provider pubkey if available and different (stale session guard)
+          // Use provider pubkey if available (stale session guard)
           const effectiveAddr=providerAddr||walletAddr;
           const fromPubkey=new PublicKey(effectiveAddr);
           const usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
@@ -308,14 +330,16 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
             sol=solLamports/1e9;
             if(CFG.devMode) console.log("[LOGOFF Pay] SOL balance:",sol,"SOL (",solLamports,"lamports)");
           }catch(solErr){
-            if(CFG.devMode) console.error("[LOGOFF Pay] getBalance failed:",solErr);
-            if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});
+            const errType=classifySolanaRpcError(solErr);
+            if(CFG.devMode) console.error("[LOGOFF Pay] getBalance failed ("+errType+"):",solErr);
+            if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:errType});
             return;
           }
 
           // USDC balance — use getTokenAccountBalance (parsed RPC, no manual byte parsing)
           let usdc=0;
           let ataReadFailed=false;
+          let ataErrType="fetch_failed";
           try{
             // First check if ATA exists
             const ataInfo=await connection.getAccountInfo(fromATA);
@@ -332,7 +356,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
               usdc=0;
             }
           }catch(ataErr){
-            if(CFG.devMode) console.error("[LOGOFF Pay] USDC balance read failed:",ataErr);
+            ataErrType=classifySolanaRpcError(ataErr);
+            if(CFG.devMode) console.error("[LOGOFF Pay] USDC balance read failed ("+ataErrType+"):",ataErr);
             // Fallback: try getParsedTokenAccountsByOwner
             try{
               if(CFG.devMode) console.log("[LOGOFF Pay] Trying fallback: getParsedTokenAccountsByOwner...");
@@ -350,7 +375,7 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
           }
 
           if(ataReadFailed){
-            if(!cancelled) setBalance({usdc:null,native:sol,loading:false,error:"fetch_failed"});
+            if(!cancelled) setBalance({usdc:null,native:sol,loading:false,error:ataErrType});
             return;
           }
 
@@ -358,8 +383,9 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
           if(!cancelled) setBalance({usdc,native:sol,loading:false,error:null});
         }
       }catch(e){
-        if(CFG.devMode) console.error("[LOGOFF Pay] Balance fetch error:",e);
-        if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});
+        const errType=classifySolanaRpcError(e);
+        if(CFG.devMode) console.error("[LOGOFF Pay] Balance fetch error ("+errType+"):",e);
+        if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:errType});
       }
     };
     fetchBalance();
@@ -368,7 +394,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
 
   // ── Derived state for button ──
   const wrongChain=balance?.error==="wrong_chain";
-  const fetchFailed=balance?.error==="fetch_failed";
+  const rpcRejected=balance?.error==="rpc_rejected";
+  const fetchFailed=balance?.error==="fetch_failed"||rpcRejected;
   const balanceLoaded=balance&&!balance.loading&&!balance.error;
   const insufficientUSDC=balanceLoaded&&balance.usdc<CFG.amount;
   const insufficientSOL=payChain==="solana"&&balanceLoaded&&balance.native!==null&&balance.native<0.01;
@@ -443,7 +470,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       }
       const{Connection,PublicKey,Transaction,TransactionInstruction,SystemProgram}=window.solanaWeb3;
 
-      const connection=new Connection("https://api.mainnet-beta.solana.com","confirmed");
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — RPC URL:",CFG.solanaRpc);
+      const connection=new Connection(CFG.solanaRpc,"confirmed");
 
       // Use provider.publicKey as source of truth (guards against stale session)
       const fromAddr=provider.publicKey?.toString()||wallet.addr;
@@ -599,6 +627,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
     };
   }else if(!balance||balance.loading){
     btnLabel="Checking balance...";btnDisabled=true;
+  }else if(rpcRejected){
+    btnLabel="Solana RPC unavailable";btnDisabled=true;
   }else if(fetchFailed){
     btnLabel=payChain==="solana"?"Could not read Solana balance":"Could not read balance";btnDisabled=true;
   }else if(insufficientSOL){
@@ -626,7 +656,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         <div className="pay-balance">
           {balance.loading&&<span style={{color:"var(--mute)"}}>Checking balance...</span>}
           {balance.error==="wrong_chain"&&<span style={{color:"var(--warn,#f5a623)"}}>Wrong network — switch to Base</span>}
-          {balance.error==="fetch_failed"&&<span style={{color:"#e74c3c"}}>{payChain==="solana"?"Could not read your Solana USDC balance. Reconnect Phantom and try again.":"Could not read balance. Please try again."}</span>}
+          {balance.error==="rpc_rejected"&&<span style={{color:"#e74c3c"}}>Could not reach the Solana RPC. Please try again shortly.</span>}
+          {balance.error==="fetch_failed"&&<span style={{color:"#e74c3c"}}>Could not read balance. Please try again.</span>}
           {balanceLoaded&&<>
             <span style={{color:insufficientUSDC?"#e74c3c":"var(--dim)"}}>Balance: {balance.usdc.toFixed(2)} USDC</span>
             {payChain==="solana"&&balance.native!==null&&<span style={{color:insufficientSOL?"#e74c3c":"var(--mute)",marginLeft:8,fontSize:12}}>({balance.native.toFixed(4)} SOL)</span>}
