@@ -272,19 +272,33 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
           }
           const{Connection,PublicKey}=window.solanaWeb3;
           const connection=new Connection("https://api.mainnet-beta.solana.com","confirmed");
-          const fromPubkey=new PublicKey(wallet.addr);
+
+          // Validate wallet address matches Phantom provider
+          const provider=window.phantom?.solana||window.solana;
+          const providerAddr=provider?.publicKey?.toString()||null;
+          const walletAddr=wallet.addr;
+          if(CFG.devMode){
+            console.log("[LOGOFF Pay] wallet.addr:",walletAddr);
+            console.log("[LOGOFF Pay] provider.publicKey:",providerAddr);
+            if(providerAddr&&providerAddr!==walletAddr) console.warn("[LOGOFF Pay] MISMATCH: wallet.addr differs from provider.publicKey!");
+          }
+
+          // Use provider pubkey if available and different (stale session guard)
+          const effectiveAddr=providerAddr||walletAddr;
+          const fromPubkey=new PublicKey(effectiveAddr);
           const usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
           const TOKEN_PROGRAM=new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
           const ATA_PROGRAM=new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
-          // Derive sender ATA
+          // Derive ATAs for logging
           const[fromATA]=PublicKey.findProgramAddressSync([fromPubkey.toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
           const[recipientATA]=PublicKey.findProgramAddressSync([new PublicKey(CFG.recipientSOL).toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
 
           if(CFG.devMode){
-            console.log("[LOGOFF Pay] Solana wallet:",wallet.addr);
-            console.log("[LOGOFF Pay] Sender ATA:",fromATA.toString());
-            console.log("[LOGOFF Pay] Recipient ATA:",recipientATA.toString());
+            console.log("[LOGOFF Pay] USDC mint:",usdcMint.toString());
+            console.log("[LOGOFF Pay] Effective address:",effectiveAddr);
+            console.log("[LOGOFF Pay] Sender ATA (derived):",fromATA.toString());
+            console.log("[LOGOFF Pay] Recipient ATA (derived):",recipientATA.toString());
           }
 
           // SOL balance for fees
@@ -292,38 +306,55 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
           try{
             const solLamports=await connection.getBalance(fromPubkey);
             sol=solLamports/1e9;
-            if(CFG.devMode) console.log("[LOGOFF Pay] SOL balance (lamports):",solLamports,"parsed:",sol);
+            if(CFG.devMode) console.log("[LOGOFF Pay] SOL balance:",sol,"SOL (",solLamports,"lamports)");
           }catch(solErr){
             if(CFG.devMode) console.error("[LOGOFF Pay] getBalance failed:",solErr);
             if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});
             return;
           }
 
-          // USDC ATA balance
-          let usdc=null;
+          // USDC balance — use getTokenAccountBalance (parsed RPC, no manual byte parsing)
+          let usdc=0;
           let ataReadFailed=false;
           try{
+            // First check if ATA exists
             const ataInfo=await connection.getAccountInfo(fromATA);
-            if(CFG.devMode) console.log("[LOGOFF Pay] Sender ATA getAccountInfo result:",ataInfo?`exists, data length=${ataInfo.data.length}`:"null (no account)");
-            if(ataInfo&&ataInfo.data.length>=72){
-              const dv=new DataView(ataInfo.data.buffer,ataInfo.data.byteOffset,ataInfo.data.byteLength);
-              const rawAmount=dv.getBigUint64(64,true);
-              usdc=Number(rawAmount)/1e6;
+            if(CFG.devMode) console.log("[LOGOFF Pay] Sender ATA getAccountInfo:",ataInfo?"exists (owner="+ataInfo.owner?.toString()+", dataLen="+ataInfo.data?.length+")":"null (no account)");
+
+            if(ataInfo){
+              // ATA exists — use getTokenAccountBalance for robust parsed response
+              const balResult=await connection.getTokenAccountBalance(fromATA);
+              if(CFG.devMode) console.log("[LOGOFF Pay] getTokenAccountBalance result:",JSON.stringify(balResult));
+              usdc=Number(balResult.value.uiAmount||0);
             }else{
-              // ATA doesn't exist — wallet has no USDC token account, balance is 0
+              // No ATA = no USDC token account = 0 balance
+              if(CFG.devMode) console.log("[LOGOFF Pay] No USDC ATA found — balance is 0");
               usdc=0;
             }
           }catch(ataErr){
-            if(CFG.devMode) console.error("[LOGOFF Pay] Could not read Solana USDC ATA:",ataErr);
-            ataReadFailed=true;
+            if(CFG.devMode) console.error("[LOGOFF Pay] USDC balance read failed:",ataErr);
+            // Fallback: try getParsedTokenAccountsByOwner
+            try{
+              if(CFG.devMode) console.log("[LOGOFF Pay] Trying fallback: getParsedTokenAccountsByOwner...");
+              const resp=await connection.getParsedTokenAccountsByOwner(fromPubkey,{mint:usdcMint});
+              if(CFG.devMode) console.log("[LOGOFF Pay] getParsedTokenAccountsByOwner result:",JSON.stringify(resp));
+              if(resp.value.length>0){
+                usdc=resp.value[0].account.data.parsed.info.tokenAmount.uiAmount||0;
+              }else{
+                usdc=0;
+              }
+            }catch(fallbackErr){
+              if(CFG.devMode) console.error("[LOGOFF Pay] Fallback also failed:",fallbackErr);
+              ataReadFailed=true;
+            }
           }
 
-          if(ataReadFailed||usdc===null){
+          if(ataReadFailed){
             if(!cancelled) setBalance({usdc:null,native:sol,loading:false,error:"fetch_failed"});
             return;
           }
 
-          if(CFG.devMode) console.log("[LOGOFF Pay] Solana USDC balance:",usdc,"SOL balance:",sol);
+          if(CFG.devMode) console.log("[LOGOFF Pay] Final — USDC:",usdc,"SOL:",sol);
           if(!cancelled) setBalance({usdc,native:sol,loading:false,error:null});
         }
       }catch(e){
@@ -413,17 +444,22 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       const{Connection,PublicKey,Transaction,TransactionInstruction,SystemProgram}=window.solanaWeb3;
 
       const connection=new Connection("https://api.mainnet-beta.solana.com","confirmed");
-      const fromPubkey=new PublicKey(wallet.addr);
+
+      // Use provider.publicKey as source of truth (guards against stale session)
+      const fromAddr=provider.publicKey?.toString()||wallet.addr;
+      const fromPubkey=new PublicKey(fromAddr);
       const toPubkey=new PublicKey(CFG.recipientSOL);
       const usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
       const TOKEN_PROGRAM=new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
       const ATA_PROGRAM=new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
       const RENT=new PublicKey("SysvarRent111111111111111111111111111111111");
 
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — from:",fromAddr);
+
       // Check SOL balance for fees
       const solLamports=await connection.getBalance(fromPubkey);
       const solBalance=solLamports/1e9;
-      if(CFG.devMode) console.log("[LOGOFF Pay] Solana SOL balance:",solBalance);
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — SOL balance:",solBalance);
       if(solBalance<0.01){
         setErr("Not enough SOL for network fees.");setWs("idle");return;
       }
@@ -432,21 +468,20 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       const[fromATA]=PublicKey.findProgramAddressSync([fromPubkey.toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
       const[toATA]=PublicKey.findProgramAddressSync([toPubkey.toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
 
-      // Check sender USDC balance
+      // Check sender USDC balance using parsed RPC (no manual byte parsing)
       let senderUsdcBalance=0;
       try{
         const ataInfo=await connection.getAccountInfo(fromATA);
-        if(ataInfo&&ataInfo.data.length>=72){
-          const dv=new DataView(ataInfo.data.buffer,ataInfo.data.byteOffset,ataInfo.data.byteLength);
-          const rawAmount=dv.getBigUint64(64,true);
-          senderUsdcBalance=Number(rawAmount)/1e6;
+        if(ataInfo){
+          const balResult=await connection.getTokenAccountBalance(fromATA);
+          senderUsdcBalance=Number(balResult.value.uiAmount||0);
         }
       }catch(ataErr){
-        if(CFG.devMode) console.error("[LOGOFF Pay] Could not read sender USDC ATA:",ataErr);
+        if(CFG.devMode) console.error("[LOGOFF Pay] paySolana — could not read sender USDC:",ataErr);
         setErr("Could not read your USDC balance. Please try again.");setWs("idle");return;
       }
 
-      if(CFG.devMode) console.log("[LOGOFF Pay] Solana USDC balance:",senderUsdcBalance,"needed:",CFG.amount);
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — USDC balance:",senderUsdcBalance,"needed:",CFG.amount);
       if(senderUsdcBalance<CFG.amount){
         setErr(`Insufficient USDC balance on Solana. You need at least ${CFG.amount} USDC.`);
         setWs("idle");return;
