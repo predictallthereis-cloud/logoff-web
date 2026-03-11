@@ -441,31 +441,41 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       if(!provider)throw new Error("Phantom wallet not detected. Install from phantom.app");
 
       const connection=new Connection(CFG.solanaRpc,"confirmed");
-      const USDC_MINT=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
       const USDC_DECIMALS=6;
 
-      // Use provider.publicKey as source of truth
-      const fromPubkey=provider.publicKey||new PublicKey(wallet.addr);
+      // CRITICAL: Always create PublicKey from STRING, never reuse Phantom's PublicKey objects.
+      // Phantom bundles its own @solana/web3.js — passing its PublicKey to our npm helpers
+      // causes corrupted instruction data (different internal buffer layout).
+      const fromAddr=provider.publicKey?.toString()||wallet.addr;
+      const fromPubkey=new PublicKey(fromAddr);
       const toPubkey=new PublicKey(CFG.recipientSOL);
+      const usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
       const amountRaw=BigInt(CFG.amount)*BigInt(10**USDC_DECIMALS);
 
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — RPC:",CFG.solanaRpc);
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — from:",fromPubkey.toString());
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — to (owner):",toPubkey.toString());
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — mint:",USDC_MINT.toString());
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — amount raw:",amountRaw.toString(),"(",CFG.amount,"USDC)");
+      if(CFG.devMode){
+        console.log("[LOGOFF Pay] paySolana ══════════════════════");
+        console.log("[LOGOFF Pay] RPC:",CFG.solanaRpc);
+        console.log("[LOGOFF Pay] wallet.addr:",wallet.addr);
+        console.log("[LOGOFF Pay] provider.publicKey:",provider.publicKey?.toString());
+        console.log("[LOGOFF Pay] fromPubkey (from string):",fromPubkey.toString());
+        console.log("[LOGOFF Pay] toPubkey (recipient owner):",toPubkey.toString());
+        console.log("[LOGOFF Pay] USDC mint:",usdcMint.toString());
+        console.log("[LOGOFF Pay] amountRaw:",amountRaw.toString(),"("+CFG.amount+" USDC)");
+      }
 
-      // Derive ATAs using official helper
-      const fromATA=await getAssociatedTokenAddress(USDC_MINT,fromPubkey);
-      const toATA=await getAssociatedTokenAddress(USDC_MINT,toPubkey);
+      // Derive ATAs using official helper — all from our npm PublicKey instances
+      const fromATA=await getAssociatedTokenAddress(usdcMint,fromPubkey);
+      const toATA=await getAssociatedTokenAddress(usdcMint,toPubkey);
 
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — sender ATA:",fromATA.toString());
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — recipient ATA:",toATA.toString());
+      if(CFG.devMode){
+        console.log("[LOGOFF Pay] sender ATA:",fromATA.toString());
+        console.log("[LOGOFF Pay] recipient ATA:",toATA.toString());
+      }
 
       // Check SOL balance for fees
       const solLamports=await connection.getBalance(fromPubkey);
       const solBalance=solLamports/1e9;
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — SOL balance:",solBalance);
+      if(CFG.devMode) console.log("[LOGOFF Pay] SOL balance:",solBalance);
       if(solBalance<0.01){
         setErr("Not enough SOL for network fees.");setWs("idle");return;
       }
@@ -476,81 +486,104 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         const tokenAccount=await getAccount(connection,fromATA);
         senderUsdcBalance=Number(tokenAccount.amount)/1e6;
       }catch(ataErr){
-        if(ataErr instanceof TokenAccountNotFoundError){
+        const errName=ataErr?.name||"";
+        if(ataErr instanceof TokenAccountNotFoundError||errName==="TokenAccountNotFoundError"){
           senderUsdcBalance=0;
         }else{
-          if(CFG.devMode) console.error("[LOGOFF Pay] paySolana — could not read sender USDC:",ataErr);
+          if(CFG.devMode) console.error("[LOGOFF Pay] could not read sender USDC:",ataErr);
           setErr("Could not read your USDC balance. Please try again.");setWs("idle");return;
         }
       }
 
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — USDC balance:",senderUsdcBalance,"needed:",CFG.amount);
+      if(CFG.devMode) console.log("[LOGOFF Pay] USDC balance:",senderUsdcBalance,"needed:",CFG.amount);
       if(senderUsdcBalance<CFG.amount){
         setErr(`Insufficient USDC balance on Solana. You need at least ${CFG.amount} USDC.`);
         setWs("idle");return;
       }
 
-      // Build transaction with official SPL Token helpers
+      // Build transaction — ONLY official SPL helpers, nothing manual
       const tx=new Transaction();
 
-      // Create recipient ATA if it doesn't exist (official helper)
+      // Check if recipient ATA exists
       let recipientATAExists=false;
       try{
         await getAccount(connection,toATA);
         recipientATAExists=true;
       }catch(e){
-        if(e instanceof TokenAccountNotFoundError){
+        const errName=e?.name||"";
+        if(e instanceof TokenAccountNotFoundError||errName==="TokenAccountNotFoundError"){
           recipientATAExists=false;
         }else{
           if(CFG.devMode) console.error("[LOGOFF Pay] Could not check recipient ATA:",e);
+          // Assume it doesn't exist to be safe
+          recipientATAExists=false;
         }
       }
+
       if(!recipientATAExists){
-        if(CFG.devMode) console.log("[LOGOFF Pay] Adding createAssociatedTokenAccountInstruction for recipient");
+        if(CFG.devMode) console.log("[LOGOFF Pay] Recipient ATA does NOT exist — adding create instruction");
         tx.add(createAssociatedTokenAccountInstruction(
           fromPubkey,  // payer
           toATA,       // associatedToken
           toPubkey,    // owner
-          USDC_MINT    // mint
+          usdcMint     // mint
         ));
+      }else{
+        if(CFG.devMode) console.log("[LOGOFF Pay] Recipient ATA exists — no create needed");
       }
 
-      // transferChecked (official helper)
+      // transferChecked — official helper
       tx.add(createTransferCheckedInstruction(
         fromATA,       // source
-        USDC_MINT,     // mint
+        usdcMint,      // mint
         toATA,         // destination
         fromPubkey,    // owner/authority
-        amountRaw,     // amount (raw with decimals)
-        USDC_DECIMALS  // decimals
+        amountRaw,     // amount in raw units (149000000)
+        USDC_DECIMALS  // decimals (6)
       ));
 
+      // Detailed instruction log
       if(CFG.devMode){
-        console.log("[LOGOFF Pay] Transaction instructions:",tx.instructions.length);
+        console.log("[LOGOFF Pay] Total instructions:",tx.instructions.length);
         tx.instructions.forEach((ix,i)=>{
-          console.log(`[LOGOFF Pay]   ix[${i}] programId=${ix.programId.toString()} keys=${ix.keys.length} dataLen=${ix.data.length} data=[${Array.from(ix.data).join(",")}]`);
+          const dataHex=Array.from(ix.data).map(b=>b.toString(16).padStart(2,"0")).join("");
+          console.log(`[LOGOFF Pay] ix[${i}] program=${ix.programId.toString()} accounts=${ix.keys.length} data(hex)=${dataHex}`);
+          ix.keys.forEach((k,j)=>{
+            console.log(`[LOGOFF Pay]   key[${j}] ${k.pubkey.toString()} signer=${k.isSigner} writable=${k.isWritable}`);
+          });
         });
       }
 
       tx.feePayer=fromPubkey;
-      const{blockhash}=await connection.getLatestBlockhash();
+      const{blockhash,lastValidBlockHeight}=await connection.getLatestBlockhash();
       tx.recentBlockhash=blockhash;
 
-      // Simulate before signing to catch issues early
-      if(CFG.devMode){
-        try{
-          const sim=await connection.simulateTransaction(tx);
-          console.log("[LOGOFF Pay] Simulation result:",JSON.stringify(sim.value));
-          if(sim.value.err){
-            console.error("[LOGOFF Pay] Simulation failed:",sim.value.err);
-          }
-        }catch(simErr){
-          console.error("[LOGOFF Pay] Simulation error:",simErr);
+      // ══ MANDATORY SIMULATION — block if it fails ══
+      let simOk=false;
+      try{
+        const sim=await connection.simulateTransaction(tx);
+        if(CFG.devMode){
+          console.log("[LOGOFF Pay] Simulation err:",sim.value.err);
+          console.log("[LOGOFF Pay] Simulation logs:",sim.value.logs);
         }
+        if(!sim.value.err){
+          simOk=true;
+        }else{
+          if(CFG.devMode) console.error("[LOGOFF Pay] Simulation FAILED:",JSON.stringify(sim.value.err));
+        }
+      }catch(simErr){
+        if(CFG.devMode) console.error("[LOGOFF Pay] Simulation threw:",simErr);
       }
 
+      if(!simOk){
+        setErr("Transaction preview looks invalid. Payment blocked for safety.");
+        setWs("idle");return;
+      }
+
+      if(CFG.devMode) console.log("[LOGOFF Pay] Simulation OK — opening Phantom for signature");
+
       const{signature}=await provider.signAndSendTransaction(tx);
-      await connection.confirmTransaction(signature,"confirmed");
+      await connection.confirmTransaction({signature,blockhash,lastValidBlockHeight},"confirmed");
 
       setTxHash(signature);setPaidChain("Solana");setWs("done");
     }catch(e){
