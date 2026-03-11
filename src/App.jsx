@@ -277,23 +277,50 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
           const TOKEN_PROGRAM=new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
           const ATA_PROGRAM=new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
+          // Derive sender ATA
+          const[fromATA]=PublicKey.findProgramAddressSync([fromPubkey.toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
+          const[recipientATA]=PublicKey.findProgramAddressSync([new PublicKey(CFG.recipientSOL).toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
+
+          if(CFG.devMode){
+            console.log("[LOGOFF Pay] Solana wallet:",wallet.addr);
+            console.log("[LOGOFF Pay] Sender ATA:",fromATA.toString());
+            console.log("[LOGOFF Pay] Recipient ATA:",recipientATA.toString());
+          }
+
           // SOL balance for fees
-          const solLamports=await connection.getBalance(fromPubkey);
-          const sol=solLamports/1e9;
+          let sol=0;
+          try{
+            const solLamports=await connection.getBalance(fromPubkey);
+            sol=solLamports/1e9;
+            if(CFG.devMode) console.log("[LOGOFF Pay] SOL balance (lamports):",solLamports,"parsed:",sol);
+          }catch(solErr){
+            if(CFG.devMode) console.error("[LOGOFF Pay] getBalance failed:",solErr);
+            if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});
+            return;
+          }
 
           // USDC ATA balance
-          const[fromATA]=PublicKey.findProgramAddressSync([fromPubkey.toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
-          let usdc=0;
+          let usdc=null;
+          let ataReadFailed=false;
           try{
             const ataInfo=await connection.getAccountInfo(fromATA);
+            if(CFG.devMode) console.log("[LOGOFF Pay] Sender ATA getAccountInfo result:",ataInfo?`exists, data length=${ataInfo.data.length}`:"null (no account)");
             if(ataInfo&&ataInfo.data.length>=72){
-              // SPL token account: amount is at offset 64, 8 bytes LE
               const dv=new DataView(ataInfo.data.buffer,ataInfo.data.byteOffset,ataInfo.data.byteLength);
               const rawAmount=dv.getBigUint64(64,true);
               usdc=Number(rawAmount)/1e6;
+            }else{
+              // ATA doesn't exist — wallet has no USDC token account, balance is 0
+              usdc=0;
             }
           }catch(ataErr){
-            if(CFG.devMode) console.warn("[LOGOFF Pay] Could not read Solana USDC ATA:",ataErr);
+            if(CFG.devMode) console.error("[LOGOFF Pay] Could not read Solana USDC ATA:",ataErr);
+            ataReadFailed=true;
+          }
+
+          if(ataReadFailed||usdc===null){
+            if(!cancelled) setBalance({usdc:null,native:sol,loading:false,error:"fetch_failed"});
+            return;
           }
 
           if(CFG.devMode) console.log("[LOGOFF Pay] Solana USDC balance:",usdc,"SOL balance:",sol);
@@ -310,6 +337,7 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
 
   // ── Derived state for button ──
   const wrongChain=balance?.error==="wrong_chain";
+  const fetchFailed=balance?.error==="fetch_failed";
   const balanceLoaded=balance&&!balance.loading&&!balance.error;
   const insufficientUSDC=balanceLoaded&&balance.usdc<CFG.amount;
   const insufficientSOL=payChain==="solana"&&balanceLoaded&&balance.native!==null&&balance.native<0.01;
@@ -364,6 +392,11 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
 
   // ── Solana SPL USDC pay via Phantom ──
   const paySolana=async()=>{
+    // Guard: do not proceed if balance wasn't successfully read
+    if(!balanceLoaded){
+      setErr("Could not read your Solana USDC balance. Reconnect Phantom and try again.");
+      return;
+    }
     setWs("paying");setErr("");
     try{
       const provider=window.phantom?.solana||window.solana;
@@ -508,6 +541,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
 
   // ── Determine pay button state & label ──
   const handlePay=()=>{
+    // Final guard: never call pay functions without confirmed balance
+    if(!canPay) return;
     track("pay_click",{chain:payChain});
     if(payChain==="base") payBase();
     else paySolana();
@@ -527,8 +562,10 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
     btnLabel="Switch to Base \u2192";btnDisabled=false;btnAction=async()=>{
       try{await window.ethereum.request({method:"wallet_switchEthereumChain",params:[{chainId:CFG.baseChainId}]});}catch{}
     };
-  }else if(balance?.loading){
+  }else if(!balance||balance.loading){
     btnLabel="Checking balance...";btnDisabled=true;
+  }else if(fetchFailed){
+    btnLabel=payChain==="solana"?"Could not read Solana balance":"Could not read balance";btnDisabled=true;
   }else if(insufficientSOL){
     btnLabel="Not enough SOL for fees";btnDisabled=true;
   }else if(insufficientUSDC){
@@ -554,7 +591,7 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         <div className="pay-balance">
           {balance.loading&&<span style={{color:"var(--mute)"}}>Checking balance...</span>}
           {balance.error==="wrong_chain"&&<span style={{color:"var(--warn,#f5a623)"}}>Wrong network — switch to Base</span>}
-          {balance.error==="fetch_failed"&&<span style={{color:"var(--mute)"}}>Could not read balance</span>}
+          {balance.error==="fetch_failed"&&<span style={{color:"#e74c3c"}}>{payChain==="solana"?"Could not read your Solana USDC balance. Reconnect Phantom and try again.":"Could not read balance. Please try again."}</span>}
           {balanceLoaded&&<>
             <span style={{color:insufficientUSDC?"#e74c3c":"var(--dim)"}}>Balance: {balance.usdc.toFixed(2)} USDC</span>
             {payChain==="solana"&&balance.native!==null&&<span style={{color:insufficientSOL?"#e74c3c":"var(--mute)",marginLeft:8,fontSize:12}}>({balance.native.toFixed(4)} SOL)</span>}
