@@ -253,6 +253,9 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
   const[paidChain,setPaidChain]=useState(null);
   const[balance,setBalance]=useState(null); // { usdc: number, native: number|null, loading: bool, error: string|null }
 
+  // Synchronous lock — prevents double invocation regardless of React batching
+  const payInFlightRef=useRef(false);
+
   const isConnected=!!wallet?.addr;
   const chainMatch=isConnected&&((payChain==="base"&&wallet.chain!=="solana")||(payChain==="solana"&&wallet.chain==="solana"));
 
@@ -440,58 +443,58 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
     }
   };
 
-  // ── Solana SPL USDC pay via Phantom (official @solana/spl-token helpers) ──
+  // ── Solana SPL USDC pay via Phantom ──
   const paySolana=async()=>{
+    // ── Synchronous lock: block duplicate calls ──
+    if(payInFlightRef.current){
+      if(CFG.devMode) console.warn("[LOGOFF Pay] paySolana BLOCKED — already in flight");
+      return;
+    }
     if(!balanceLoaded){
       setErr("Could not read your Solana USDC balance. Reconnect Phantom and try again.");
       return;
     }
+    payInFlightRef.current=true;
+    const attemptId=Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+    const log=CFG.devMode?(...a)=>console.log(`[LOGOFF Pay][${attemptId}]`,...a):()=>{};
+    const logErr=CFG.devMode?(...a)=>console.error(`[LOGOFF Pay][${attemptId}]`,...a):()=>{};
+
     setWs("paying");setErr("");
     try{
+      log("paySolana START");
       const provider=window.phantom?.solana||window.solana;
       if(!provider)throw new Error("Phantom wallet not detected. Install from phantom.app");
 
       const connection=new Connection(CFG.solanaRpc,"confirmed");
       const USDC_DECIMALS=6;
 
-      // CRITICAL: Always create PublicKey from STRING, never reuse Phantom's PublicKey objects.
-      // Phantom bundles its own @solana/web3.js — passing its PublicKey to our npm helpers
-      // causes corrupted instruction data (different internal buffer layout).
+      // All PublicKeys from strings — never reuse Phantom's objects
       const fromAddr=provider.publicKey?.toString()||wallet.addr;
       const fromPubkey=new PublicKey(fromAddr);
       const toPubkey=new PublicKey(CFG.recipientSOL);
       const usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
       const amountRaw=BigInt(CFG.amount)*BigInt(10**USDC_DECIMALS);
 
-      if(CFG.devMode){
-        console.log("[LOGOFF Pay] paySolana ══════════════════════");
-        console.log("[LOGOFF Pay] RPC:",CFG.solanaRpc);
-        console.log("[LOGOFF Pay] wallet.addr:",wallet.addr);
-        console.log("[LOGOFF Pay] provider.publicKey:",provider.publicKey?.toString());
-        console.log("[LOGOFF Pay] fromPubkey (from string):",fromPubkey.toString());
-        console.log("[LOGOFF Pay] toPubkey (recipient owner):",toPubkey.toString());
-        console.log("[LOGOFF Pay] USDC mint:",usdcMint.toString());
-        console.log("[LOGOFF Pay] amountRaw:",amountRaw.toString(),"("+CFG.amount+" USDC)");
-      }
+      log("from:",fromAddr);
+      log("to (owner):",CFG.recipientSOL);
+      log("mint:",usdcMint.toString());
+      log("amountRaw:",amountRaw.toString(),"("+CFG.amount+" USDC)");
 
-      // Derive ATAs using official helper — all from our npm PublicKey instances
+      // Derive ATAs
       const fromATA=await getAssociatedTokenAddress(usdcMint,fromPubkey);
       const toATA=await getAssociatedTokenAddress(usdcMint,toPubkey);
+      log("sender ATA:",fromATA.toString());
+      log("recipient ATA:",toATA.toString());
 
-      if(CFG.devMode){
-        console.log("[LOGOFF Pay] sender ATA:",fromATA.toString());
-        console.log("[LOGOFF Pay] recipient ATA:",toATA.toString());
-      }
-
-      // Check SOL balance for fees
+      // SOL balance check
       const solLamports=await connection.getBalance(fromPubkey);
       const solBalance=solLamports/1e9;
-      if(CFG.devMode) console.log("[LOGOFF Pay] SOL balance:",solBalance);
+      log("SOL balance:",solBalance);
       if(solBalance<0.01){
-        setErr("Not enough SOL for network fees.");setWs("idle");return;
+        setErr("Not enough SOL for network fees.");setWs("idle");payInFlightRef.current=false;return;
       }
 
-      // Check sender USDC balance
+      // USDC balance check
       let senderUsdcBalance=0;
       try{
         const tokenAccount=await getAccount(connection,fromATA);
@@ -501,21 +504,21 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         if(ataErr instanceof TokenAccountNotFoundError||errName==="TokenAccountNotFoundError"){
           senderUsdcBalance=0;
         }else{
-          if(CFG.devMode) console.error("[LOGOFF Pay] could not read sender USDC:",ataErr);
-          setErr("Could not read your USDC balance. Please try again.");setWs("idle");return;
+          logErr("could not read sender USDC:",ataErr);
+          setErr("Could not read your USDC balance. Please try again.");setWs("idle");payInFlightRef.current=false;return;
         }
       }
-
-      if(CFG.devMode) console.log("[LOGOFF Pay] USDC balance:",senderUsdcBalance,"needed:",CFG.amount);
+      log("USDC balance:",senderUsdcBalance,"needed:",CFG.amount);
       if(senderUsdcBalance<CFG.amount){
         setErr(`Insufficient USDC balance on Solana. You need at least ${CFG.amount} USDC.`);
-        setWs("idle");return;
+        setWs("idle");payInFlightRef.current=false;return;
       }
 
-      // Build transaction — ONLY official SPL helpers, nothing manual
+      // ── Build transaction (ONE time, ONLY official helpers) ──
+      log("building tx");
       const tx=new Transaction();
 
-      // Check if recipient ATA exists
+      // Recipient ATA
       let recipientATAExists=false;
       try{
         await getAccount(connection,toATA);
@@ -525,80 +528,77 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         if(e instanceof TokenAccountNotFoundError||errName==="TokenAccountNotFoundError"){
           recipientATAExists=false;
         }else{
-          if(CFG.devMode) console.error("[LOGOFF Pay] Could not check recipient ATA:",e);
-          // Assume it doesn't exist to be safe
+          logErr("Could not check recipient ATA:",e);
           recipientATAExists=false;
         }
       }
 
       if(!recipientATAExists){
-        if(CFG.devMode) console.log("[LOGOFF Pay] Recipient ATA does NOT exist — adding create instruction");
-        tx.add(createAssociatedTokenAccountInstruction(
-          fromPubkey,  // payer
-          toATA,       // associatedToken
-          toPubkey,    // owner
-          usdcMint     // mint
-        ));
+        log("Recipient ATA does NOT exist — adding create ix");
+        tx.add(createAssociatedTokenAccountInstruction(fromPubkey,toATA,toPubkey,usdcMint));
       }else{
-        if(CFG.devMode) console.log("[LOGOFF Pay] Recipient ATA exists — no create needed");
+        log("Recipient ATA exists");
       }
 
-      // transferChecked — official helper
-      tx.add(createTransferCheckedInstruction(
-        fromATA,       // source
-        usdcMint,      // mint
-        toATA,         // destination
-        fromPubkey,    // owner/authority
-        amountRaw,     // amount in raw units (149000000)
-        USDC_DECIMALS  // decimals (6)
-      ));
+      // transferChecked
+      tx.add(createTransferCheckedInstruction(fromATA,usdcMint,toATA,fromPubkey,amountRaw,USDC_DECIMALS));
+      log("tx built — instructions:",tx.instructions.length);
 
-      // Detailed instruction log
-      if(CFG.devMode){
-        console.log("[LOGOFF Pay] Total instructions:",tx.instructions.length);
-        tx.instructions.forEach((ix,i)=>{
-          const dataHex=Array.from(ix.data).map(b=>b.toString(16).padStart(2,"0")).join("");
-          console.log(`[LOGOFF Pay] ix[${i}] program=${ix.programId.toString()} accounts=${ix.keys.length} data(hex)=${dataHex}`);
-          ix.keys.forEach((k,j)=>{
-            console.log(`[LOGOFF Pay]   key[${j}] ${k.pubkey.toString()} signer=${k.isSigner} writable=${k.isWritable}`);
-          });
-        });
-      }
+      // Instruction fingerprint
+      tx.instructions.forEach((ix,i)=>{
+        const dataHex=Array.from(ix.data).map(b=>b.toString(16).padStart(2,"0")).join("");
+        log(`ix[${i}] program=${ix.programId.toString()} accounts=${ix.keys.length} data(hex)=${dataHex}`);
+      });
 
       tx.feePayer=fromPubkey;
       const{blockhash,lastValidBlockHeight}=await connection.getLatestBlockhash();
       tx.recentBlockhash=blockhash;
+      log("blockhash:",blockhash);
 
-      // ══ MANDATORY SIMULATION — block if it fails ══
+      // Serialize for fingerprint (verifySignatures=false since unsigned)
+      const serializedMsg=tx.serializeMessage().toString("base64");
+      log("tx message (base64):",serializedMsg.slice(0,80)+"...");
+
+      // ── Mandatory simulation ──
+      log("simulation start");
       let simOk=false;
       try{
         const sim=await connection.simulateTransaction(tx);
-        if(CFG.devMode){
-          console.log("[LOGOFF Pay] Simulation err:",sim.value.err);
-          console.log("[LOGOFF Pay] Simulation logs:",sim.value.logs);
-        }
-        if(!sim.value.err){
-          simOk=true;
-        }else{
-          if(CFG.devMode) console.error("[LOGOFF Pay] Simulation FAILED:",JSON.stringify(sim.value.err));
-        }
+        log("simulation err:",sim.value.err);
+        log("simulation logs:",sim.value.logs);
+        if(!sim.value.err) simOk=true;
+        else logErr("Simulation FAILED:",JSON.stringify(sim.value.err));
       }catch(simErr){
-        if(CFG.devMode) console.error("[LOGOFF Pay] Simulation threw:",simErr);
+        logErr("simulation threw:",simErr);
       }
 
       if(!simOk){
         setErr("Transaction preview looks invalid. Payment blocked for safety.");
-        setWs("idle");return;
+        setWs("idle");payInFlightRef.current=false;return;
       }
+      log("simulation OK");
 
-      if(CFG.devMode) console.log("[LOGOFF Pay] Simulation OK — opening Phantom for signature");
+      // ── Sign + send: use signTransaction + sendRawTransaction ──
+      // This avoids Phantom re-serializing our tx with its own web3.js version.
+      // We serialize the raw bytes ourselves, Phantom only adds the signature.
+      log("opening Phantom for signature (signTransaction)");
+      const signed=await provider.signTransaction(tx);
+      log("signature received, sending raw transaction");
 
-      const{signature}=await provider.signAndSendTransaction(tx);
+      const rawTx=signed.serialize();
+      log("serialized signed tx length:",rawTx.length);
+
+      const signature=await connection.sendRawTransaction(rawTx,{skipPreflight:false,preflightCommitment:"confirmed"});
+      log("sendRawTransaction returned sig:",signature);
+
+      log("confirmTransaction start");
       await connection.confirmTransaction({signature,blockhash,lastValidBlockHeight},"confirmed");
+      log("confirmTransaction OK");
 
       setTxHash(signature);setPaidChain("Solana");setWs("done");
+      log("paySolana END — success");
     }catch(e){
-      if(CFG.devMode) console.error("[LOGOFF Pay] Solana tx error:",e);
+      logErr("Solana tx error:",e);
       const msg=e?.message||"";
       if(msg.includes("User rejected")||msg.includes("user rejected")){
         setErr("Transaction cancelled.");
@@ -610,6 +610,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         setErr(CFG.devMode?msg:"Solana payment failed. Please try again.");
       }
       setWs("idle");
+    }finally{
+      payInFlightRef.current=false;
     }
   };
 
@@ -633,8 +635,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
 
   // ── Determine pay button state & label ──
   const handlePay=()=>{
-    // Final guard: never call pay functions without confirmed balance
     if(!canPay) return;
+    if(payInFlightRef.current) return; // synchronous double-click guard
     track("pay_click",{chain:payChain});
     if(payChain==="base") payBase();
     else paySolana();
