@@ -283,67 +283,84 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
           if(CFG.devMode) console.log("[LOGOFF Pay] Base USDC balance raw:",usdcRaw.toString(),"parsed:",usdc);
           if(!cancelled) setBalance({usdc,native:null,loading:false,error:null});
         }else{
-          if(CFG.devMode) console.log("[LOGOFF Pay] Solana RPC URL:",CFG.solanaRpc);
-          const connection=new Connection(CFG.solanaRpc,"confirmed");
-          const USDC_MINT=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+          if(CFG.devMode) console.log("[LOGOFF Pay] === Solana balance fetch start ===");
+          if(CFG.devMode) console.log("[LOGOFF Pay] RPC URL:",CFG.solanaRpc);
 
-          // Validate wallet address matches Phantom provider
+          const connection=new Connection(CFG.solanaRpc,"confirmed");
+          const USDC_MINT_STR="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+          const usdcMint=new PublicKey(USDC_MINT_STR);
+
+          // Always use string addresses to avoid cross-library PublicKey issues
           const provider=window.phantom?.solana||window.solana;
           const providerAddr=provider?.publicKey?.toString()||null;
           const walletAddr=wallet.addr;
+          const effectiveAddr=providerAddr||walletAddr;
+
           if(CFG.devMode){
             console.log("[LOGOFF Pay] wallet.addr:",walletAddr);
             console.log("[LOGOFF Pay] provider.publicKey:",providerAddr);
-            if(providerAddr&&providerAddr!==walletAddr) console.warn("[LOGOFF Pay] MISMATCH: wallet.addr differs from provider.publicKey!");
+            console.log("[LOGOFF Pay] effectiveAddr:",effectiveAddr);
           }
 
-          const effectiveAddr=providerAddr||walletAddr;
+          // Create PublicKey from string (never from Phantom's PublicKey object)
           const fromPubkey=new PublicKey(effectiveAddr);
+          if(CFG.devMode) console.log("[LOGOFF Pay] fromPubkey created:",fromPubkey.toString());
 
           // Derive ATAs using official helper
-          const fromATA=await getAssociatedTokenAddress(USDC_MINT,fromPubkey);
-          const recipientPubkey=new PublicKey(CFG.recipientSOL);
-          const recipientATA=await getAssociatedTokenAddress(USDC_MINT,recipientPubkey);
-
-          if(CFG.devMode){
-            console.log("[LOGOFF Pay] USDC mint:",USDC_MINT.toString());
-            console.log("[LOGOFF Pay] Effective address:",effectiveAddr);
-            console.log("[LOGOFF Pay] Sender ATA:",fromATA.toString());
-            console.log("[LOGOFF Pay] Recipient ATA:",recipientATA.toString());
+          let fromATA,recipientATA;
+          try{
+            fromATA=await getAssociatedTokenAddress(usdcMint,fromPubkey);
+            const recipientPubkey=new PublicKey(CFG.recipientSOL);
+            recipientATA=await getAssociatedTokenAddress(usdcMint,recipientPubkey);
+            if(CFG.devMode){
+              console.log("[LOGOFF Pay] Sender ATA:",fromATA.toString());
+              console.log("[LOGOFF Pay] Recipient ATA:",recipientATA.toString());
+            }
+          }catch(ataDerivErr){
+            if(CFG.devMode) console.error("[LOGOFF Pay] ATA derivation failed:",ataDerivErr?.name,ataDerivErr?.message,ataDerivErr);
+            if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});
+            return;
           }
 
           // SOL balance for fees
           let sol=0;
           try{
+            if(CFG.devMode) console.log("[LOGOFF Pay] Calling getBalance...");
             const solLamports=await connection.getBalance(fromPubkey);
             sol=solLamports/1e9;
-            if(CFG.devMode) console.log("[LOGOFF Pay] SOL balance:",sol,"SOL (",solLamports,"lamports)");
+            if(CFG.devMode) console.log("[LOGOFF Pay] SOL balance:",sol,"(",solLamports,"lamports)");
           }catch(solErr){
             const errType=classifySolanaRpcError(solErr);
-            if(CFG.devMode) console.error("[LOGOFF Pay] getBalance failed ("+errType+"):",solErr);
+            if(CFG.devMode) console.error("[LOGOFF Pay] getBalance failed ("+errType+"):",solErr?.name,solErr?.message,solErr);
             if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:errType});
             return;
           }
 
-          // USDC balance via official getAccount helper
+          // USDC balance via getAccount
           let usdc=0;
           try{
+            if(CFG.devMode) console.log("[LOGOFF Pay] Calling getAccount for sender ATA...");
             const tokenAccount=await getAccount(connection,fromATA);
             usdc=Number(tokenAccount.amount)/1e6;
-            if(CFG.devMode) console.log("[LOGOFF Pay] getAccount result — raw amount:",tokenAccount.amount.toString(),"parsed:",usdc);
+            if(CFG.devMode) console.log("[LOGOFF Pay] getAccount OK — raw:",tokenAccount.amount.toString(),"parsed:",usdc,"USDC");
           }catch(ataErr){
-            if(ataErr instanceof TokenAccountNotFoundError){
+            // Check by error name (robust across library versions)
+            const errName=ataErr?.name||"";
+            if(ataErr instanceof TokenAccountNotFoundError||errName==="TokenAccountNotFoundError"){
               if(CFG.devMode) console.log("[LOGOFF Pay] No USDC ATA found — balance is 0");
+              usdc=0;
+            }else if(errName==="TokenInvalidAccountOwnerError"){
+              if(CFG.devMode) console.log("[LOGOFF Pay] ATA exists but wrong owner — treating as 0");
               usdc=0;
             }else{
               const errType=classifySolanaRpcError(ataErr);
-              if(CFG.devMode) console.error("[LOGOFF Pay] USDC balance read failed ("+errType+"):",ataErr);
+              if(CFG.devMode) console.error("[LOGOFF Pay] getAccount failed ("+errType+"):",ataErr?.name,ataErr?.message,ataErr);
               if(!cancelled) setBalance({usdc:null,native:sol,loading:false,error:errType});
               return;
             }
           }
 
-          if(CFG.devMode) console.log("[LOGOFF Pay] Final — USDC:",usdc,"SOL:",sol);
+          if(CFG.devMode) console.log("[LOGOFF Pay] === Final — USDC:",usdc,"SOL:",sol,"===");
           if(!cancelled) setBalance({usdc,native:sol,loading:false,error:null});
         }
       }catch(e){
