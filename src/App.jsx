@@ -4,6 +4,8 @@ import metamaskIcon from "./assets/metamask.svg";
 import coinbaseIcon from "./assets/coinbase.svg";
 import phantomIcon from "./assets/phantom.svg";
 import bhHero from "./assets/bh-hero.jpg";
+import { Connection, PublicKey, Transaction } from "@solana/web3.js";
+import { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, createTransferCheckedInstruction, getAccount, TokenAccountNotFoundError } from "@solana/spl-token";
 
 /* ══════════════════════════ CONFIG ══════════════════════════ */
 const CFG = {
@@ -281,19 +283,9 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
           if(CFG.devMode) console.log("[LOGOFF Pay] Base USDC balance raw:",usdcRaw.toString(),"parsed:",usdc);
           if(!cancelled) setBalance({usdc,native:null,loading:false,error:null});
         }else{
-          // Solana — load web3 if needed
-          if(!window.solanaWeb3){
-            await new Promise((resolve,reject)=>{
-              const s=document.createElement("script");
-              s.src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js";
-              s.onload=resolve;s.onerror=()=>reject(new Error("Failed to load Solana library"));
-              document.head.appendChild(s);
-            });
-          }
-          const{Connection,PublicKey}=window.solanaWeb3;
-
           if(CFG.devMode) console.log("[LOGOFF Pay] Solana RPC URL:",CFG.solanaRpc);
           const connection=new Connection(CFG.solanaRpc,"confirmed");
+          const USDC_MINT=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
           // Validate wallet address matches Phantom provider
           const provider=window.phantom?.solana||window.solana;
@@ -305,22 +297,19 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
             if(providerAddr&&providerAddr!==walletAddr) console.warn("[LOGOFF Pay] MISMATCH: wallet.addr differs from provider.publicKey!");
           }
 
-          // Use provider pubkey if available (stale session guard)
           const effectiveAddr=providerAddr||walletAddr;
           const fromPubkey=new PublicKey(effectiveAddr);
-          const usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-          const TOKEN_PROGRAM=new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-          const ATA_PROGRAM=new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
-          // Derive ATAs for logging
-          const[fromATA]=PublicKey.findProgramAddressSync([fromPubkey.toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
-          const[recipientATA]=PublicKey.findProgramAddressSync([new PublicKey(CFG.recipientSOL).toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
+          // Derive ATAs using official helper
+          const fromATA=await getAssociatedTokenAddress(USDC_MINT,fromPubkey);
+          const recipientPubkey=new PublicKey(CFG.recipientSOL);
+          const recipientATA=await getAssociatedTokenAddress(USDC_MINT,recipientPubkey);
 
           if(CFG.devMode){
-            console.log("[LOGOFF Pay] USDC mint:",usdcMint.toString());
+            console.log("[LOGOFF Pay] USDC mint:",USDC_MINT.toString());
             console.log("[LOGOFF Pay] Effective address:",effectiveAddr);
-            console.log("[LOGOFF Pay] Sender ATA (derived):",fromATA.toString());
-            console.log("[LOGOFF Pay] Recipient ATA (derived):",recipientATA.toString());
+            console.log("[LOGOFF Pay] Sender ATA:",fromATA.toString());
+            console.log("[LOGOFF Pay] Recipient ATA:",recipientATA.toString());
           }
 
           // SOL balance for fees
@@ -336,47 +325,22 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
             return;
           }
 
-          // USDC balance — use getTokenAccountBalance (parsed RPC, no manual byte parsing)
+          // USDC balance via official getAccount helper
           let usdc=0;
-          let ataReadFailed=false;
-          let ataErrType="fetch_failed";
           try{
-            // First check if ATA exists
-            const ataInfo=await connection.getAccountInfo(fromATA);
-            if(CFG.devMode) console.log("[LOGOFF Pay] Sender ATA getAccountInfo:",ataInfo?"exists (owner="+ataInfo.owner?.toString()+", dataLen="+ataInfo.data?.length+")":"null (no account)");
-
-            if(ataInfo){
-              // ATA exists — use getTokenAccountBalance for robust parsed response
-              const balResult=await connection.getTokenAccountBalance(fromATA);
-              if(CFG.devMode) console.log("[LOGOFF Pay] getTokenAccountBalance result:",JSON.stringify(balResult));
-              usdc=Number(balResult.value.uiAmount||0);
-            }else{
-              // No ATA = no USDC token account = 0 balance
+            const tokenAccount=await getAccount(connection,fromATA);
+            usdc=Number(tokenAccount.amount)/1e6;
+            if(CFG.devMode) console.log("[LOGOFF Pay] getAccount result — raw amount:",tokenAccount.amount.toString(),"parsed:",usdc);
+          }catch(ataErr){
+            if(ataErr instanceof TokenAccountNotFoundError){
               if(CFG.devMode) console.log("[LOGOFF Pay] No USDC ATA found — balance is 0");
               usdc=0;
+            }else{
+              const errType=classifySolanaRpcError(ataErr);
+              if(CFG.devMode) console.error("[LOGOFF Pay] USDC balance read failed ("+errType+"):",ataErr);
+              if(!cancelled) setBalance({usdc:null,native:sol,loading:false,error:errType});
+              return;
             }
-          }catch(ataErr){
-            ataErrType=classifySolanaRpcError(ataErr);
-            if(CFG.devMode) console.error("[LOGOFF Pay] USDC balance read failed ("+ataErrType+"):",ataErr);
-            // Fallback: try getParsedTokenAccountsByOwner
-            try{
-              if(CFG.devMode) console.log("[LOGOFF Pay] Trying fallback: getParsedTokenAccountsByOwner...");
-              const resp=await connection.getParsedTokenAccountsByOwner(fromPubkey,{mint:usdcMint});
-              if(CFG.devMode) console.log("[LOGOFF Pay] getParsedTokenAccountsByOwner result:",JSON.stringify(resp));
-              if(resp.value.length>0){
-                usdc=resp.value[0].account.data.parsed.info.tokenAmount.uiAmount||0;
-              }else{
-                usdc=0;
-              }
-            }catch(fallbackErr){
-              if(CFG.devMode) console.error("[LOGOFF Pay] Fallback also failed:",fallbackErr);
-              ataReadFailed=true;
-            }
-          }
-
-          if(ataReadFailed){
-            if(!cancelled) setBalance({usdc:null,native:sol,loading:false,error:ataErrType});
-            return;
           }
 
           if(CFG.devMode) console.log("[LOGOFF Pay] Final — USDC:",usdc,"SOL:",sol);
@@ -448,9 +412,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
     }
   };
 
-  // ── Solana SPL USDC pay via Phantom ──
+  // ── Solana SPL USDC pay via Phantom (official @solana/spl-token helpers) ──
   const paySolana=async()=>{
-    // Guard: do not proceed if balance wasn't successfully read
     if(!balanceLoaded){
       setErr("Could not read your Solana USDC balance. Reconnect Phantom and try again.");
       return;
@@ -460,28 +423,27 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       const provider=window.phantom?.solana||window.solana;
       if(!provider)throw new Error("Phantom wallet not detected. Install from phantom.app");
 
-      if(!window.solanaWeb3){
-        await new Promise((resolve,reject)=>{
-          const s=document.createElement("script");
-          s.src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js";
-          s.onload=resolve;s.onerror=()=>reject(new Error("Failed to load Solana library"));
-          document.head.appendChild(s);
-        });
-      }
-      const{Connection,PublicKey,Transaction,TransactionInstruction,SystemProgram}=window.solanaWeb3;
-
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — RPC URL:",CFG.solanaRpc);
       const connection=new Connection(CFG.solanaRpc,"confirmed");
+      const USDC_MINT=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+      const USDC_DECIMALS=6;
 
-      // Use provider.publicKey as source of truth (guards against stale session)
-      const fromAddr=provider.publicKey?.toString()||wallet.addr;
-      const fromPubkey=new PublicKey(fromAddr);
+      // Use provider.publicKey as source of truth
+      const fromPubkey=provider.publicKey||new PublicKey(wallet.addr);
       const toPubkey=new PublicKey(CFG.recipientSOL);
-      const usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-      const TOKEN_PROGRAM=new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-      const ATA_PROGRAM=new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+      const amountRaw=BigInt(CFG.amount)*BigInt(10**USDC_DECIMALS);
 
-      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — from:",fromAddr);
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — RPC:",CFG.solanaRpc);
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — from:",fromPubkey.toString());
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — to (owner):",toPubkey.toString());
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — mint:",USDC_MINT.toString());
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — amount raw:",amountRaw.toString(),"(",CFG.amount,"USDC)");
+
+      // Derive ATAs using official helper
+      const fromATA=await getAssociatedTokenAddress(USDC_MINT,fromPubkey);
+      const toATA=await getAssociatedTokenAddress(USDC_MINT,toPubkey);
+
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — sender ATA:",fromATA.toString());
+      if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — recipient ATA:",toATA.toString());
 
       // Check SOL balance for fees
       const solLamports=await connection.getBalance(fromPubkey);
@@ -491,21 +453,18 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         setErr("Not enough SOL for network fees.");setWs("idle");return;
       }
 
-      // Derive ATAs
-      const[fromATA]=PublicKey.findProgramAddressSync([fromPubkey.toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
-      const[toATA]=PublicKey.findProgramAddressSync([toPubkey.toBuffer(),TOKEN_PROGRAM.toBuffer(),usdcMint.toBuffer()],ATA_PROGRAM);
-
-      // Check sender USDC balance using parsed RPC (no manual byte parsing)
+      // Check sender USDC balance
       let senderUsdcBalance=0;
       try{
-        const ataInfo=await connection.getAccountInfo(fromATA);
-        if(ataInfo){
-          const balResult=await connection.getTokenAccountBalance(fromATA);
-          senderUsdcBalance=Number(balResult.value.uiAmount||0);
-        }
+        const tokenAccount=await getAccount(connection,fromATA);
+        senderUsdcBalance=Number(tokenAccount.amount)/1e6;
       }catch(ataErr){
-        if(CFG.devMode) console.error("[LOGOFF Pay] paySolana — could not read sender USDC:",ataErr);
-        setErr("Could not read your USDC balance. Please try again.");setWs("idle");return;
+        if(ataErr instanceof TokenAccountNotFoundError){
+          senderUsdcBalance=0;
+        }else{
+          if(CFG.devMode) console.error("[LOGOFF Pay] paySolana — could not read sender USDC:",ataErr);
+          setErr("Could not read your USDC balance. Please try again.");setWs("idle");return;
+        }
       }
 
       if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — USDC balance:",senderUsdcBalance,"needed:",CFG.amount);
@@ -514,62 +473,64 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         setWs("idle");return;
       }
 
+      // Build transaction with official SPL Token helpers
       const tx=new Transaction();
 
-      // ── Create recipient ATA if needed (idempotent, ix index 1) ──
-      let toATAInfo;
+      // Create recipient ATA if it doesn't exist (official helper)
+      let recipientATAExists=false;
       try{
-        toATAInfo=await connection.getAccountInfo(toATA);
+        await getAccount(connection,toATA);
+        recipientATAExists=true;
       }catch(e){
-        if(CFG.devMode) console.error("[LOGOFF Pay] Could not check recipient ATA:",e);
+        if(e instanceof TokenAccountNotFoundError){
+          recipientATAExists=false;
+        }else{
+          if(CFG.devMode) console.error("[LOGOFF Pay] Could not check recipient ATA:",e);
+        }
       }
-      if(!toATAInfo){
-        if(CFG.devMode) console.log("[LOGOFF Pay] Adding createAssociatedTokenAccountIdempotent for recipient ATA:",toATA.toString());
-        // createAssociatedTokenAccountIdempotent (ix index 1) — Phantom recognizes this
-        // Accounts: payer, ata, owner, mint, systemProgram, tokenProgram
-        tx.add(new TransactionInstruction({
-          keys:[
-            {pubkey:fromPubkey,isSigner:true,isWritable:true},
-            {pubkey:toATA,isSigner:false,isWritable:true},
-            {pubkey:toPubkey,isSigner:false,isWritable:false},
-            {pubkey:usdcMint,isSigner:false,isWritable:false},
-            {pubkey:SystemProgram.programId,isSigner:false,isWritable:false},
-            {pubkey:TOKEN_PROGRAM,isSigner:false,isWritable:false},
-          ],
-          programId:ATA_PROGRAM,
-          data:new Uint8Array([1]), // instruction index 1 = createIdempotent
-        }));
+      if(!recipientATAExists){
+        if(CFG.devMode) console.log("[LOGOFF Pay] Adding createAssociatedTokenAccountInstruction for recipient");
+        tx.add(createAssociatedTokenAccountInstruction(
+          fromPubkey,  // payer
+          toATA,       // associatedToken
+          toPubkey,    // owner
+          USDC_MINT    // mint
+        ));
       }
 
-      // ── transferChecked (SPL Token ix index 12) ──
-      // Accounts order: source, mint, destination, authority (canonical @solana/spl-token order)
-      const amountRaw=BigInt(CFG.amount)*BigInt(1e6);
-      const transferData=new Uint8Array(1+8+1);
-      transferData[0]=12; // transferChecked
-      new DataView(transferData.buffer).setBigUint64(1,amountRaw,true);
-      transferData[9]=6; // decimals
-
-      tx.add(new TransactionInstruction({
-        keys:[
-          {pubkey:fromATA,isSigner:false,isWritable:true},    // source
-          {pubkey:usdcMint,isSigner:false,isWritable:false},  // mint
-          {pubkey:toATA,isSigner:false,isWritable:true},      // destination
-          {pubkey:fromPubkey,isSigner:true,isWritable:false},  // authority/owner
-        ],
-        programId:TOKEN_PROGRAM,
-        data:transferData,
-      }));
+      // transferChecked (official helper)
+      tx.add(createTransferCheckedInstruction(
+        fromATA,       // source
+        USDC_MINT,     // mint
+        toATA,         // destination
+        fromPubkey,    // owner/authority
+        amountRaw,     // amount (raw with decimals)
+        USDC_DECIMALS  // decimals
+      ));
 
       if(CFG.devMode){
         console.log("[LOGOFF Pay] Transaction instructions:",tx.instructions.length);
         tx.instructions.forEach((ix,i)=>{
-          console.log(`[LOGOFF Pay]   ix[${i}] programId=${ix.programId.toString()} keys=${ix.keys.length} dataLen=${ix.data.length}`);
+          console.log(`[LOGOFF Pay]   ix[${i}] programId=${ix.programId.toString()} keys=${ix.keys.length} dataLen=${ix.data.length} data=[${Array.from(ix.data).join(",")}]`);
         });
       }
 
       tx.feePayer=fromPubkey;
       const{blockhash}=await connection.getLatestBlockhash();
       tx.recentBlockhash=blockhash;
+
+      // Simulate before signing to catch issues early
+      if(CFG.devMode){
+        try{
+          const sim=await connection.simulateTransaction(tx);
+          console.log("[LOGOFF Pay] Simulation result:",JSON.stringify(sim.value));
+          if(sim.value.err){
+            console.error("[LOGOFF Pay] Simulation failed:",sim.value.err);
+          }
+        }catch(simErr){
+          console.error("[LOGOFF Pay] Simulation error:",simErr);
+        }
+      }
 
       const{signature}=await provider.signAndSendTransaction(tx);
       await connection.confirmTransaction(signature,"confirmed");
