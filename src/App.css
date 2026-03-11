@@ -103,6 +103,7 @@ body{font-family:'Manrope',sans-serif;background:var(--bg);color:var(--txt);-web
 .wcon .cb2{font-size:11px;padding:2px 8px;background:rgba(201,168,76,.1);color:var(--gold);border-radius:4px;margin-left:8px}
 .wnote{font-size:12px;color:var(--mute);margin-top:16px;line-height:1.6}
 .werr{padding:10px 14px;background:rgba(212,106,106,.08);border:1px solid rgba(212,106,106,.15);border-radius:8px;margin-bottom:16px;font-size:13px;color:var(--red);text-align:left}
+.pay-balance{text-align:center;font-size:13px;padding:8px 0 4px;letter-spacing:.3px}
 
 /* Post-payment confirmation */
 .confirm-box{text-align:left;padding:24px;background:var(--bg2);border:1px solid var(--bdr);border-radius:10px;margin-top:20px}
