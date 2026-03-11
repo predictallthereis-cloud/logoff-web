@@ -480,7 +480,6 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       const usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
       const TOKEN_PROGRAM=new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
       const ATA_PROGRAM=new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-      const RENT=new PublicKey("SysvarRent111111111111111111111111111111111");
 
       if(CFG.devMode) console.log("[LOGOFF Pay] paySolana — from:",fromAddr);
 
@@ -515,27 +514,9 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         setWs("idle");return;
       }
 
-      // Build transferChecked instruction
-      const amountRaw=BigInt(CFG.amount)*BigInt(1e6);
-      const dataArr=new Uint8Array(1+8+1);
-      dataArr[0]=12; // transferChecked instruction index
-      new DataView(dataArr.buffer).setBigUint64(1,amountRaw,true);
-      dataArr[9]=6; // decimals
-
-      const transferIx=new TransactionInstruction({
-        keys:[
-          {pubkey:fromATA,isSigner:false,isWritable:true},
-          {pubkey:usdcMint,isSigner:false,isWritable:false},
-          {pubkey:toATA,isSigner:false,isWritable:true},
-          {pubkey:fromPubkey,isSigner:true,isWritable:false},
-        ],
-        programId:TOKEN_PROGRAM,
-        data:dataArr,
-      });
-
       const tx=new Transaction();
 
-      // Create recipient ATA if it doesn't exist
+      // ── Create recipient ATA if needed (idempotent, ix index 1) ──
       let toATAInfo;
       try{
         toATAInfo=await connection.getAccountInfo(toATA);
@@ -543,7 +524,9 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         if(CFG.devMode) console.error("[LOGOFF Pay] Could not check recipient ATA:",e);
       }
       if(!toATAInfo){
-        if(CFG.devMode) console.log("[LOGOFF Pay] Creating recipient ATA:",toATA.toString());
+        if(CFG.devMode) console.log("[LOGOFF Pay] Adding createAssociatedTokenAccountIdempotent for recipient ATA:",toATA.toString());
+        // createAssociatedTokenAccountIdempotent (ix index 1) — Phantom recognizes this
+        // Accounts: payer, ata, owner, mint, systemProgram, tokenProgram
         tx.add(new TransactionInstruction({
           keys:[
             {pubkey:fromPubkey,isSigner:true,isWritable:true},
@@ -552,14 +535,38 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
             {pubkey:usdcMint,isSigner:false,isWritable:false},
             {pubkey:SystemProgram.programId,isSigner:false,isWritable:false},
             {pubkey:TOKEN_PROGRAM,isSigner:false,isWritable:false},
-            {pubkey:RENT,isSigner:false,isWritable:false},
           ],
           programId:ATA_PROGRAM,
-          data:new Uint8Array(0),
+          data:new Uint8Array([1]), // instruction index 1 = createIdempotent
         }));
       }
 
-      tx.add(transferIx);
+      // ── transferChecked (SPL Token ix index 12) ──
+      // Accounts order: source, mint, destination, authority (canonical @solana/spl-token order)
+      const amountRaw=BigInt(CFG.amount)*BigInt(1e6);
+      const transferData=new Uint8Array(1+8+1);
+      transferData[0]=12; // transferChecked
+      new DataView(transferData.buffer).setBigUint64(1,amountRaw,true);
+      transferData[9]=6; // decimals
+
+      tx.add(new TransactionInstruction({
+        keys:[
+          {pubkey:fromATA,isSigner:false,isWritable:true},    // source
+          {pubkey:usdcMint,isSigner:false,isWritable:false},  // mint
+          {pubkey:toATA,isSigner:false,isWritable:true},      // destination
+          {pubkey:fromPubkey,isSigner:true,isWritable:false},  // authority/owner
+        ],
+        programId:TOKEN_PROGRAM,
+        data:transferData,
+      }));
+
+      if(CFG.devMode){
+        console.log("[LOGOFF Pay] Transaction instructions:",tx.instructions.length);
+        tx.instructions.forEach((ix,i)=>{
+          console.log(`[LOGOFF Pay]   ix[${i}] programId=${ix.programId.toString()} keys=${ix.keys.length} dataLen=${ix.data.length}`);
+        });
+      }
+
       tx.feePayer=fromPubkey;
       const{blockhash}=await connection.getLatestBlockhash();
       tx.recentBlockhash=blockhash;
