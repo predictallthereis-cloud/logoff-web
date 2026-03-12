@@ -42,28 +42,35 @@ const isDevWallet = (addr, chain) => (CFG.devWallets[chain === "solana" ? "solan
 function loadWalletSession() {
   try { const s = JSON.parse(localStorage.getItem(WALLET_KEY) || "null"); if (s?.addr) return s; } catch {} return null;
 }
-function saveWalletSession(chain, addr) {
+function saveWalletSession(chain, addr, provider) {
   const isDev = isDevWallet(addr, chain);
-  const s = { chain, addr, isDev, key: isDev ? "pk_dev_" + addr.slice(0, 8) : null };
+  const s = { chain, addr, provider: provider||null, isDev, key: isDev ? "pk_dev_" + addr.slice(0, 8) : null };
   try { localStorage.setItem(WALLET_KEY, JSON.stringify(s)); } catch {} return s;
 }
 function clearWalletSession() { try { localStorage.removeItem(WALLET_KEY); } catch {} }
 
-async function connectEvmWallet() {
-  const p = window.ethereum;
-  if (!p) throw new Error("No EVM wallet detected");
+async function connectEvmWallet(providerHint) {
+  let p;
+  if(providerHint==="coinbase") p=getCoinbaseProvider();
+  else p=getMetaMaskProvider();
+  if(!p) throw new Error(providerHint==="coinbase"
+    ?"Coinbase Wallet not detected. Please install or unlock Coinbase Wallet."
+    :"MetaMask not detected. Please install or unlock MetaMask.");
+  if(CFG.devMode) console.log("[LOGOFF Wallet] connectEvmWallet using provider:",
+    "isMetaMask="+!!p.isMetaMask,"isPhantom="+!!p.isPhantom,
+    "isCoinbaseWallet="+!!p.isCoinbaseWallet);
   try { await p.request({ method: "wallet_switchEthereumChain", params: [{ chainId: CFG.baseChainId }] }); }
   catch (se) { if (se.code === 4902) await p.request({ method: "wallet_addEthereumChain", params: [{ chainId: CFG.baseChainId, chainName: "Base", nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 }, rpcUrls: ["https://mainnet.base.org"], blockExplorerUrls: ["https://basescan.org"] }] }); else throw se; }
   const accs = await p.request({ method: "eth_requestAccounts" });
-  if (accs?.length) return accs[0];
+  if (accs?.length) return { addr: accs[0], provider: providerHint==="coinbase"?"coinbase":"metamask" };
   throw new Error("No accounts returned");
 }
 
 async function connectSolWallet() {
-  const p = window.phantom?.solana || window.solana;
-  if (!p?.isPhantom) throw new Error("Phantom not detected. Install from phantom.app");
+  const p = getPhantomSolanaProvider();
+  if (!p) throw new Error("Phantom not detected. Please install or unlock Phantom.");
   const r = await p.connect();
-  return r.publicKey.toString();
+  return { addr: r.publicKey.toString(), provider: "phantom" };
 }
 
 /* ══════════════════════════ COMPONENTS ══════════════════════════ */
@@ -124,7 +131,51 @@ function HeroOrb({mode="image"}){
 
 function FaqItem({item}){const[o,setO]=useState(false);return(<div className="faq-i"><button className="faq-q" onClick={()=>setO(!o)}>{item.q}<span className={`faq-ar ${o?"o":""}`}>{"\u25be"}</span></button>{o&&<div className="faq-a">{item.a}</div>}</div>)}
 
-function detectWallets(){return{hasMetaMask:!!window.ethereum?.isMetaMask,hasCoinbase:!!(window.ethereum?.isCoinbaseWallet||window.coinbaseWalletExtension),hasEVM:!!window.ethereum,hasPhantom:!!(window.phantom?.solana?.isPhantom||window.solana?.isPhantom)}}
+/* ── Provider helpers: never let Phantom handle EVM, never let MetaMask handle Solana ── */
+function getMetaMaskProvider(){
+  const provs=window.ethereum?.providers;
+  if(Array.isArray(provs)){
+    // Multi-provider: pick the one that is MetaMask but NOT Phantom
+    const mm=provs.find(p=>p.isMetaMask&&!p.isPhantom);
+    if(mm) return mm;
+  }
+  // Single provider — only use if it's real MetaMask (not Phantom pretending)
+  if(window.ethereum?.isMetaMask&&!window.ethereum?.isPhantom) return window.ethereum;
+  return null;
+}
+function getCoinbaseProvider(){
+  const provs=window.ethereum?.providers;
+  if(Array.isArray(provs)){
+    const cb=provs.find(p=>p.isCoinbaseWallet);
+    if(cb) return cb;
+  }
+  if(window.ethereum?.isCoinbaseWallet) return window.ethereum;
+  if(window.coinbaseWalletExtension) return window.coinbaseWalletExtension;
+  return null;
+}
+function getPhantomSolanaProvider(){
+  const p=window.phantom?.solana||window.solana;
+  return p?.isPhantom?p:null;
+}
+function detectWallets(){
+  const mm=getMetaMaskProvider();
+  const cb=getCoinbaseProvider();
+  const ph=getPhantomSolanaProvider();
+  if(CFG.devMode){
+    console.log("[LOGOFF Wallet] detectWallets:",
+      "ethereum=",!!window.ethereum,
+      "providers=",window.ethereum?.providers?.length||"none",
+      "MetaMask=",!!mm,"(isPhantom="+!!mm?.isPhantom+")",
+      "Coinbase=",!!cb,
+      "Phantom(SOL)=",!!ph);
+    if(Array.isArray(window.ethereum?.providers)){
+      window.ethereum.providers.forEach((p,i)=>console.log(`  provider[${i}]:`,
+        "isMetaMask="+!!p.isMetaMask,"isPhantom="+!!p.isPhantom,
+        "isCoinbaseWallet="+!!p.isCoinbaseWallet));
+    }
+  }
+  return{hasMetaMask:!!mm,hasCoinbase:!!cb,hasEVM:!!(mm||cb),hasPhantom:!!ph};
+}
 const trunc=a=>a?a.slice(0,6)+"..."+a.slice(-4):"";
 
 /* ══════════════════════════ WIDGET DEMO ══════════════════════════ */
@@ -269,7 +320,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       setBalance({usdc:null,native:null,loading:true,error:null});
       try{
         if(payChain==="base"){
-          const p=window.ethereum;
+          const p=getMetaMaskProvider()||getCoinbaseProvider();
+          if(!p){if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});return;}
           // Verify chain is Base
           const chainId=await p.request({method:"eth_chainId"});
           if(chainId!==CFG.baseChainId){
@@ -284,94 +336,71 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
           if(CFG.devMode) console.log("[LOGOFF Pay] Base USDC balance raw:",usdcRaw.toString(),"parsed:",usdc);
           if(!cancelled) setBalance({usdc,native:null,loading:false,error:null});
         }else{
-          // ═══ SOLANA BALANCE FETCH — numbered steps for diagnostics ═══
+          // ── Solana balance fetch ──
           const log=CFG.devMode?(...a)=>console.log("[LOGOFF Pay]",...a):()=>{};
           const logErr=CFG.devMode?(...a)=>console.error("[LOGOFF Pay]",...a):()=>{};
 
-          log("═══ Solana balance fetch START ═══");
-          log("Step 0: RPC URL =",CFG.solanaRpc);
-
-          // Step 1: create connection
           let connection;
           try{
             connection=new Connection(CFG.solanaRpc,"confirmed");
-            log("Step 1: Connection created OK");
           }catch(e){
-            logErr("Step 1 FAILED: Connection constructor threw:",e?.name,e?.message,e);
+            logErr("Connection failed:",e?.message);
             if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"rpc_rejected"});
             return;
           }
 
-          // Step 2: resolve addresses
           const provider=window.phantom?.solana||window.solana;
-          const providerAddr=provider?.publicKey?.toString()||null;
-          const effectiveAddr=providerAddr||wallet.addr;
-          log("Step 2: wallet.addr =",wallet.addr);
-          log("Step 2: provider.publicKey =",providerAddr);
-          log("Step 2: effectiveAddr =",effectiveAddr);
+          const effectiveAddr=provider?.publicKey?.toString()||wallet.addr;
 
-          // Step 3: create PublicKeys from strings
           let fromPubkey,usdcMint;
           try{
             fromPubkey=new PublicKey(effectiveAddr);
             usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-            log("Step 3: fromPubkey =",fromPubkey.toString());
-            log("Step 3: usdcMint =",usdcMint.toString());
           }catch(e){
-            logErr("Step 3 FAILED: PublicKey constructor threw:",e?.name,e?.message,e);
+            logErr("PublicKey error:",e?.message);
             if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});
             return;
           }
 
-          // Step 4: derive sender ATA
           let fromATA;
           try{
             fromATA=await getAssociatedTokenAddress(usdcMint,fromPubkey);
-            log("Step 4: Sender ATA =",fromATA.toString());
           }catch(e){
-            logErr("Step 4 FAILED: getAssociatedTokenAddress threw:",e?.name,e?.message,e);
+            logErr("ATA derivation error:",e?.message);
             if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:"fetch_failed"});
             return;
           }
 
-          // Step 5: get SOL balance
           let sol=0;
           try{
             const solLamports=await connection.getBalance(fromPubkey);
             sol=solLamports/1e9;
-            log("Step 5: SOL balance =",sol,"(",solLamports,"lamports)");
           }catch(e){
             const errType=classifySolanaRpcError(e);
-            logErr("Step 5 FAILED: getBalance threw ("+errType+"):",e?.name,e?.message,e);
+            logErr("getBalance failed ("+errType+"):",e?.message);
             if(!cancelled) setBalance({usdc:null,native:null,loading:false,error:errType});
             return;
           }
 
-          // Step 6: get USDC balance from sender ATA
           let usdc=0;
           try{
             const tokenAccount=await getAccount(connection,fromATA);
             usdc=Number(tokenAccount.amount)/1e6;
-            log("Step 6: getAccount OK — raw amount =",tokenAccount.amount.toString(),"parsed =",usdc,"USDC");
           }catch(e){
             const errName=e?.name||"";
-            log("Step 6: getAccount threw — name="+errName+" message="+e?.message);
             if(e instanceof TokenAccountNotFoundError||errName==="TokenAccountNotFoundError"){
-              log("Step 6: Sender has no USDC ATA — balance = 0");
               usdc=0;
             }else if(errName==="TokenInvalidAccountOwnerError"){
-              log("Step 6: ATA exists but wrong owner — balance = 0");
               usdc=0;
             }else{
-              // Real error — classify and report
               const errType=classifySolanaRpcError(e);
-              logErr("Step 6 FAILED ("+errType+"):",e?.name,e?.message,e);
+              logErr("USDC read failed ("+errType+"):",e?.message);
               if(!cancelled) setBalance({usdc:null,native:sol,loading:false,error:errType});
               return;
             }
           }
 
-          log("═══ Solana balance fetch DONE — USDC:",usdc,"SOL:",sol,"═══");
+          log("Solana balance:",usdc,"USDC /",sol,"SOL");
           if(!cancelled) setBalance({usdc,native:sol,loading:false,error:null});
         }
       }catch(e){
@@ -400,7 +429,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
   const payBase=async()=>{
     setWs("paying");setErr("");
     try{
-      const p=window.ethereum;
+      const p=getMetaMaskProvider()||getCoinbaseProvider();
+      if(!p){setErr("MetaMask not detected. Please install or unlock MetaMask.");setWs("idle");return;}
 
       // Double-check chain before sending
       const chainId=await p.request({method:"eth_chainId"});
@@ -475,16 +505,11 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       const usdcMint=new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
       const amountRaw=BigInt(CFG.amount)*BigInt(10**USDC_DECIMALS);
 
-      log("from:",fromAddr);
-      log("to (owner):",CFG.recipientSOL);
-      log("mint:",usdcMint.toString());
-      log("amountRaw:",amountRaw.toString(),"("+CFG.amount+" USDC)");
+      log("from:",fromAddr,"amount:",CFG.amount,"USDC");
 
       // Derive ATAs
       const fromATA=await getAssociatedTokenAddress(usdcMint,fromPubkey);
       const toATA=await getAssociatedTokenAddress(usdcMint,toPubkey);
-      log("sender ATA:",fromATA.toString());
-      log("recipient ATA:",toATA.toString());
 
       // SOL balance check
       const solLamports=await connection.getBalance(fromPubkey);
@@ -544,30 +569,18 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       tx.add(createTransferCheckedInstruction(fromATA,usdcMint,toATA,fromPubkey,amountRaw,USDC_DECIMALS));
       log("tx built — instructions:",tx.instructions.length);
 
-      // Instruction fingerprint
-      tx.instructions.forEach((ix,i)=>{
-        const dataHex=Array.from(ix.data).map(b=>b.toString(16).padStart(2,"0")).join("");
-        log(`ix[${i}] program=${ix.programId.toString()} accounts=${ix.keys.length} data(hex)=${dataHex}`);
-      });
-
       tx.feePayer=fromPubkey;
       const{blockhash,lastValidBlockHeight}=await connection.getLatestBlockhash();
       tx.recentBlockhash=blockhash;
       log("blockhash:",blockhash);
 
-      // Serialize for fingerprint (verifySignatures=false since unsigned)
-      const serializedMsg=tx.serializeMessage().toString("base64");
-      log("tx message (base64):",serializedMsg.slice(0,80)+"...");
-
       // ── Mandatory simulation ──
-      log("simulation start");
+      log("simulating...");
       let simOk=false;
       try{
         const sim=await connection.simulateTransaction(tx);
-        log("simulation err:",sim.value.err);
-        log("simulation logs:",sim.value.logs);
         if(!sim.value.err) simOk=true;
-        else logErr("Simulation FAILED:",JSON.stringify(sim.value.err));
+        else logErr("Simulation FAILED:",JSON.stringify(sim.value.err),sim.value.logs);
       }catch(simErr){
         logErr("simulation threw:",simErr);
       }
@@ -581,19 +594,15 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       // ── Sign + send: use signTransaction + sendRawTransaction ──
       // This avoids Phantom re-serializing our tx with its own web3.js version.
       // We serialize the raw bytes ourselves, Phantom only adds the signature.
-      log("opening Phantom for signature (signTransaction)");
+      log("requesting Phantom signature...");
       const signed=await provider.signTransaction(tx);
-      log("signature received, sending raw transaction");
 
       const rawTx=signed.serialize();
-      log("serialized signed tx length:",rawTx.length);
-
       const signature=await connection.sendRawTransaction(rawTx,{skipPreflight:false,preflightCommitment:"confirmed"});
-      log("sendRawTransaction returned sig:",signature);
+      log("tx sent:",signature);
 
-      log("confirmTransaction start");
       await connection.confirmTransaction({signature,blockhash,lastValidBlockHeight},"confirmed");
-      log("confirmTransaction OK");
+      log("confirmed");
 
       setTxHash(signature);setPaidChain("Solana");setWs("done");
       log("paySolana END — success");
@@ -644,6 +653,7 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
 
   const chainLabel=payChain==="base"?"Base":"Solana";
   const walletChainLabel=wallet?.chain==="solana"?"Solana":"Base";
+  const walletProviderLabel=wallet?.provider?(" via "+wallet.provider.charAt(0).toUpperCase()+wallet.provider.slice(1)):"";
 
   let btnLabel=`Pay $${CFG.amount} USDC (30 days) \u2192`;
   let btnDisabled=false;
@@ -654,7 +664,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
     btnLabel=`Switch to ${chainLabel} wallet \u2192`;btnAction=onOpenLogin;
   }else if(wrongChain){
     btnLabel="Switch to Base \u2192";btnDisabled=false;btnAction=async()=>{
-      try{await window.ethereum.request({method:"wallet_switchEthereumChain",params:[{chainId:CFG.baseChainId}]});}catch{}
+      const p=getMetaMaskProvider()||getCoinbaseProvider();
+      if(p) try{await p.request({method:"wallet_switchEthereumChain",params:[{chainId:CFG.baseChainId}]});}catch{}
     };
   }else if(!balance||balance.loading){
     btnLabel="Checking balance...";btnDisabled=true;
@@ -687,8 +698,8 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
         <div className="pay-balance">
           {balance.loading&&<span style={{color:"var(--mute)"}}>Checking balance...</span>}
           {balance.error==="wrong_chain"&&<span style={{color:"var(--warn,#f5a623)"}}>Wrong network — switch to Base</span>}
-          {balance.error==="rpc_rejected"&&<span style={{color:"#e74c3c"}}>Solana RPC unavailable. Please try again shortly.</span>}
-          {balance.error==="fetch_failed"&&<span style={{color:"#e74c3c"}}>Could not read your Solana USDC balance. Check console for details.</span>}
+          {balance.error==="rpc_rejected"&&<span style={{color:"#e74c3c"}}>{payChain==="solana"?"Solana RPC unavailable.":"Could not reach network."} Please try again shortly.</span>}
+          {balance.error==="fetch_failed"&&<span style={{color:"#e74c3c"}}>Could not read your {payChain==="solana"?"Solana ":""}USDC balance. Check console for details.</span>}
           {balanceLoaded&&<>
             <span style={{color:insufficientUSDC?"#e74c3c":"var(--dim)"}}>Balance: {balance.usdc.toFixed(2)} USDC</span>
             {payChain==="solana"&&balance.native!==null&&<span style={{color:insufficientSOL?"#e74c3c":"var(--mute)",marginLeft:8,fontSize:12}}>({balance.native.toFixed(4)} SOL)</span>}
@@ -704,7 +715,7 @@ function PurchaseBox({wallet, onOpenLogin, onEarlyAccess}){
       </div>
 
       {/* Connected badge */}
-      {isConnected&&<div className="wcon"><span className="dt"/><span>{trunc(wallet.addr)}</span><span className="cb2">{walletChainLabel}</span></div>}
+      {isConnected&&<div className="wcon"><span className="dt"/><span>{trunc(wallet.addr)}</span><span className="cb2">{walletChainLabel}{walletProviderLabel}</span></div>}
 
       {/* Unified pay button */}
       <button className="wbtn" onClick={btnAction} disabled={btnDisabled}>
@@ -907,11 +918,16 @@ function WalletModal({onClose, onConnect}){
   const[wallets,setWallets]=useState({hasMetaMask:false,hasCoinbase:false,hasEVM:false,hasPhantom:false});
   useEffect(()=>{const t=setTimeout(()=>setWallets(detectWallets()),300);return()=>clearTimeout(t)},[]);
 
-  const connect=async(chain)=>{
+  const connect=async(chain,providerHint)=>{
     setWs("connecting");setErr("");
     try{
-      const addr=chain==="solana"?await connectSolWallet():await connectEvmWallet();
-      onConnect(chain,addr);
+      if(chain==="solana"){
+        const{addr,provider}=await connectSolWallet();
+        onConnect("solana",addr,provider);
+      }else{
+        const{addr,provider}=await connectEvmWallet(providerHint);
+        onConnect("base",addr,provider);
+      }
     }catch(e){setErr(e?.message||"Connection failed.");setWs("idle")}
   };
 
@@ -926,9 +942,8 @@ function WalletModal({onClose, onConnect}){
           <button className={`modal-tab ${tab==="solana"?"active":""}`} onClick={()=>{setTab("solana");setErr("")}}>{"\ud83d\udfe3"} Solana</button>
         </div>
         {ws==="idle"&&tab==="base"&&<div className="wallet-grid">
-          <button className="w-opt" onClick={()=>connect("evm")} disabled={!wallets.hasEVM}><div className="w-icon mm"><img src={metamaskIcon} alt="MetaMask" className="w-img"/></div>MetaMask<span className={`w-det ${wallets.hasMetaMask?"ok":"no"}`}>{wallets.hasMetaMask?"detected":"install"}</span></button>
-          <button className="w-opt" onClick={()=>connect("evm")} disabled={!wallets.hasEVM}><div className="w-icon cb"><img src={coinbaseIcon} alt="Coinbase" className="w-img"/></div>Coinbase Wallet<span className={`w-det ${wallets.hasCoinbase?"ok":"no"}`}>{wallets.hasCoinbase?"detected":"install"}</span></button>
-          {wallets.hasEVM&&!wallets.hasMetaMask&&!wallets.hasCoinbase&&<button className="w-opt" onClick={()=>connect("evm")}><div className="w-icon wc">W</div>Other Wallet<span className="w-det ok">detected</span></button>}
+          <button className="w-opt" onClick={()=>connect("base","metamask")} disabled={!wallets.hasMetaMask}><div className="w-icon mm"><img src={metamaskIcon} alt="MetaMask" className="w-img"/></div>MetaMask<span className={`w-det ${wallets.hasMetaMask?"ok":"no"}`}>{wallets.hasMetaMask?"detected":"install"}</span></button>
+          <button className="w-opt" onClick={()=>connect("base","coinbase")} disabled={!wallets.hasCoinbase}><div className="w-icon cb"><img src={coinbaseIcon} alt="Coinbase" className="w-img"/></div>Coinbase Wallet<span className={`w-det ${wallets.hasCoinbase?"ok":"no"}`}>{wallets.hasCoinbase?"detected":"install"}</span></button>
         </div>}
         {ws==="idle"&&tab==="solana"&&<div className="wallet-grid">
           <button className="w-opt" onClick={()=>connect("solana")} disabled={!wallets.hasPhantom}><div className="w-icon ph"><img src={phantomIcon} alt="Phantom" className="w-img"/></div>Phantom<span className={`w-det ${wallets.hasPhantom?"ok":"no"}`}>{wallets.hasPhantom?"detected":"install"}</span></button>
@@ -955,11 +970,11 @@ export default function App(){
   const isConnected=!!wallet?.addr;
   const isDev=!!wallet?.isDev;
 
-  const handleConnect=(chain,addr)=>{
-    const s=saveWalletSession(chain,addr);
+  const handleConnect=(chain,addr,provider)=>{
+    const s=saveWalletSession(chain,addr,provider);
     setWallet(s);
     setShowLogin(false);
-    track("connect_wallet",{chain,isDev:s.isDev});
+    track("connect_wallet",{chain,provider,isDev:s.isDev});
   };
 
   const handleDisconnect=()=>{
